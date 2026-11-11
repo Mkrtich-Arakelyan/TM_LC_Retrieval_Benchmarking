@@ -239,7 +239,7 @@ class AnalysisRequest(BaseModel):
     calculation: Text
     input_record_ids: list[UUID] = Field(min_length=1)
     input_artifact_paths: list[Text] = Field(default_factory=list)
-    operation: Literal["tm.validate_dataset", "tm.compare_reference_free"] | None = None
+    operation: Literal["tm.validate_dataset", "tm.compare_reference_free", "tm.evaluate_saved_predictions", "bench.retrieve"] | None = None
     dataset_artifact_id: UUID | None = None
     ground_truth_artifact_id: UUID | None = None
     parameters: TMFitSettings = Field(default_factory=TMFitSettings)
@@ -295,10 +295,27 @@ class AcquisitionReview(Record):
     configuration_snapshot: dict[str, JsonValue]
 
 
+class RouterChoice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action_id: Text
+    record_ids: list[UUID] = Field(default_factory=list)
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1600)]
+
+
+class RouterDecision(Record):
+    status: Literal["accepted", "rejected"]
+    action_id: str | None = None
+    action: str | None = None
+    record_ids: list[UUID] = Field(default_factory=list)
+    reason: Text
+    error: str | None = None
+    context: dict[str, JsonValue] = Field(default_factory=dict)
+
+
 class WorkflowControl(BaseModel):
     """Persisted routing metadata; agent records remain the source of evidence."""
     model_config = ConfigDict(extra="forbid")
-    next_node: Literal["scientist", "analyst", "experimentor", "preflight", "human", "acquire", "analyze", "end"] = "scientist"
+    next_node: Literal["router", "scientist", "analyst", "experimentor", "preflight", "human", "acquire", "analyze", "end"] = "scientist"
     task: Literal["proposal", "procedure", "technical_review", "analysis", "interpretation"] = "proposal"
     steps: int = Field(default=0, ge=0)
     procedure_revisions: int = Field(default=0, ge=0)
@@ -311,7 +328,7 @@ class WorkflowControl(BaseModel):
     acquisition_attempt_id: UUID | None = None
     operation_id: UUID | None = None
     pending: dict[str, JsonValue] | None = None
-    return_node: Literal["scientist", "analyst", "experimentor", "preflight", "analyze"] = "scientist"
+    return_node: Literal["router", "scientist", "analyst", "experimentor", "preflight", "analyze"] = "scientist"
     analyst_stage: Literal["before_acquisition", "after_analysis"] = "before_acquisition"
     reason: str | None = None
     failures: list[str] = Field(default_factory=list)
@@ -323,6 +340,9 @@ class WorkflowControl(BaseModel):
     literature_context: list[LiteraturePassage] = Field(default_factory=list)
     hardware_context: dict[str, JsonValue] | None = None
     numerical_request: AnalysisRequest | None = None
+    pending_numerical_requests: list[AnalysisRequest] = Field(default_factory=list)
+    router_event: dict[str, JsonValue] = Field(default_factory=dict)
+    router_analysis_ids: list[UUID] = Field(default_factory=list)
 
 
 class WorkflowState(Record):
@@ -340,4 +360,5 @@ class WorkflowState(Record):
     findings: list[ScientificFinding] = Field(default_factory=list)
     analyst_reviews: list[AnalystReview] = Field(default_factory=list)
     approvals: list[HumanApproval] = Field(default_factory=list)
+    router_decisions: list[RouterDecision] = Field(default_factory=list)
     conversation: list[ConversationEntry] = Field(default_factory=list)

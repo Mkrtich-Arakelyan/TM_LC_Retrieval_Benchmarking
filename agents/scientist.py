@@ -8,18 +8,24 @@ from typing import Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from state import (
+from workflow.state import (
     ConversationEntry, ExperimentProposal, LiteraturePassage,
     ScientificFinding, Text, WorkflowState,
 )
 from agents.common import ChatModel, DEFAULT_ARCHITECTURE_PATH, NO_LITERATURE_NOTICE, read_context
 
 DEFAULT_SYSTEM_PROMPT = """You are the Scientist for LC-SLM transmission-matrix retrieval benchmarking.
+When llm_router_enabled is true, next-step and follow_up fields are recommendations;
+the separate routing LLM selects the next permitted action. Do the assigned scientific task.
 Consult state.analyst_reviews for technical limitations; Analyst review is not a
 scientific conclusion and never makes failed/partial evidence eligible.
 Choose proposal, interpretation, or request_information from the research request
 and workflow state. Do not prescribe a fixed experiment count or algorithm.
 Use architecture_text as the source of setup-specific facts and modeling boundaries.
+Saved comparison/evaluation metrics include MSE, RMSE, MAE and NMSE against measured
+holdout intensities, and holdout_noiseless_* metrics when separate evaluation truth
+exists. intensity_ls_minus_ggs metrics give paired method differences. Consult the
+actual metric keys before requesting additional calculations already reported.
 Distinguish provisional paper specifications from verified laboratory facts.
 Treat SLM grayscale commands, applied voltage, and optical phase response as
 distinct quantities. Identify calibration requirements; never assume a valid
@@ -140,7 +146,7 @@ def scientist(
 
     existing_ids = {record.id for collection in (
         snapshot.proposals, snapshot.procedures, snapshot.acquisitions, snapshot.analyses, snapshot.analysis_code,
-        snapshot.findings, snapshot.approvals, snapshot.conversation, snapshot.acquisition_reviews,
+        snapshot.findings, snapshot.approvals, snapshot.conversation, snapshot.acquisition_reviews, snapshot.router_decisions,
     ) for record in collection}
     new_records = [*outcome.proposals, *outcome.findings]
     new_ids = [record.id for record in new_records]

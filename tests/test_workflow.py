@@ -7,10 +7,10 @@ from uuid import uuid4
 import pytest
 
 from agents.experimentor import ExperimentorOutcome
-from config import AppConfig
-from graph import Integrations, WorkflowApp
-from state import WorkflowState
-from tools.offline_fixtures import offline_integrations
+from workflow.config import AppConfig
+from workflow.graph import Integrations, WorkflowApp
+from workflow.state import WorkflowState
+from fixtures.offline import offline_integrations
 from tools.python_execution import BackendReport
 
 
@@ -317,7 +317,7 @@ def test_uncertain_acquisition_restarts_into_reconciliation(workflow_setup):
 
 
 def test_completed_journal_recovered_without_duplicate_acquisition(workflow_setup, monkeypatch):
-    import graph as graph_module
+    from workflow import graph as graph_module
     cfg, services = workflow_setup
     original_runner = graph_module.runner
     class LostCheckpoint(BaseException):
@@ -355,6 +355,9 @@ def test_changed_constraints_after_human_review_need_new_approval(workflow_setup
 
 def test_cli_explicit_fixture_and_normal_missing_configuration(tmp_path, monkeypatch, capsys):
     from main import main
+    # A developer's local .env must never turn this offline test into API calls.
+    for name in ("TM_LLM_PROVIDER", "TM_LLM_MODEL", "TM_API_KEY"):
+        monkeypatch.setenv(name, "")
     monkeypatch.setenv("TM_RUN_OUTPUT_PATH", str(tmp_path / "runs"))
     db = str(tmp_path / "cli.sqlite")
     assert main(["--db", db, "start", "Interface fixture", "--fixture"]) == 0

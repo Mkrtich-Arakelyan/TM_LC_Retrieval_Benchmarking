@@ -5,9 +5,9 @@ from typing import Protocol, Sequence
 
 from pydantic import BaseModel
 
-from state import LiteraturePassage, ScientificContext
+from workflow.state import LiteraturePassage, ScientificContext
+from workflow.config import DEFAULT_ARCHITECTURE_PATH, resolve_architecture_path
 
-DEFAULT_ARCHITECTURE_PATH = Path(__file__).resolve().parents[1] / "architecture.txt"
 NO_LITERATURE_NOTICE = "Recommendations have not been checked against the project's papers."
 
 
@@ -23,7 +23,7 @@ def read_context(
     architecture_path: str | Path,
     literature_context: Sequence[LiteraturePassage] | None,
 ) -> ScientificContext:
-    path = Path(architecture_path)
+    path = resolve_architecture_path(architecture_path)
     try:
         with path.open(encoding="utf-8", newline="") as file:
             architecture = file.read()

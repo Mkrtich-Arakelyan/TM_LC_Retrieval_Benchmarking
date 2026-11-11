@@ -7,8 +7,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from config import AppConfig
-from state import (AcquisitionResult, AcquisitionReview, ConversationEntry,
+from workflow.config import AppConfig
+from workflow.state import (AcquisitionResult, AcquisitionReview, ConversationEntry,
                    HumanApproval, WorkflowState)
 from tools.hardware import HardwareBackend, execute_acquisition, preflight
 

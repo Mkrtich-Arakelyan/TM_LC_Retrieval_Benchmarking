@@ -10,12 +10,14 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from agents.common import ChatModel, DEFAULT_ARCHITECTURE_PATH, NO_LITERATURE_NOTICE, read_context
-from config import AppConfig
-from state import (AnalysisCode, Artifact, ConversationEntry, ExperimentProcedure,
+from workflow.config import AppConfig
+from workflow.state import (AnalysisCode, Artifact, ConversationEntry, ExperimentProcedure,
                    LiteraturePassage, Text, WorkflowState)
 from tools.python_execution import ExecutionBackend, checked_inputs, execute_python, save_script
 
 DEFAULT_SYSTEM_PROMPT = """You are the Experimentor for LC-SLM TM retrieval benchmarking.
+When llm_router_enabled is true, a separate routing LLM chooses the next permitted
+action. Your next-step recommendations do not authorize or dispatch acquisition.
 Consult relevant state.analyst_reviews for data requirements and structured calculation
 requests. Explain missing inputs; you own final acquisition/procedure choices.
 Implement the Scientist's proposal technically; scientific interpretation and changes
@@ -196,7 +198,7 @@ def experimentor(
                 raise ValueError(f"Procedure revision requires version {expected_version}")
             existing = [r.id for records in (snapshot.proposals, snapshot.procedures,
                         snapshot.acquisitions, snapshot.analyses, snapshot.analysis_code,
-                        snapshot.approvals, snapshot.findings, snapshot.conversation) for r in records]
+                        snapshot.approvals, snapshot.findings, snapshot.conversation, snapshot.router_decisions) for r in records]
             if procedure.id in existing:
                 raise ValueError("Procedure revision must use a new record ID")
             for prerequisite in UNRESOLVED_PREREQUISITES:

@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 data/
 outputs/
+# Local credentials; only the blank example belongs in version control.
 .env
 config.local.json
 .env.*

@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from agents.experimentor import DEFAULT_SYSTEM_PROMPT, experimentor
-from state import HumanApproval, LiteraturePassage, WorkflowState, approval_matches
+from workflow.state import HumanApproval, LiteraturePassage, WorkflowState, approval_matches
 
 
 def procedure_response(state, version=1):
@@ -185,7 +185,7 @@ def test_model_cannot_omit_recorded_input_hash(experiment_setup, fake_model):
 
 
 def test_partial_failed_data_is_labeled_and_cannot_become_acquired(experiment_setup, fake_model, fake_backend):
-    from state import AcquisitionResult
+    from workflow.state import AcquisitionResult
 
     state, config, architecture = experiment_setup
     state.acquisitions[0] = AcquisitionResult.model_validate({
@@ -203,7 +203,7 @@ def test_repair_cannot_switch_input_selection(experiment_setup, fake_model, fake
     state, config, architecture = experiment_setup
     extra = config.numerical_input_path / "other.txt"
     extra.write_text("Different fixture")
-    from state import Artifact
+    from workflow.state import Artifact
 
     state.acquisitions[0].raw_data.append(Artifact(path=str(extra), description="Second input"))
     first = analysis_response(state)

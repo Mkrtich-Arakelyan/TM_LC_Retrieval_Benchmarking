@@ -8,9 +8,10 @@ from uuid import uuid4
 import pytest
 
 from agents.runner import runner
-from state import (AcquisitionAction, AcquisitionResult, Artifact, ExperimentProcedure,
+from fixtures.hardware import RecordingFakeBackend
+from workflow.state import (AcquisitionAction, AcquisitionResult, Artifact, ExperimentProcedure,
                    HumanApproval, Setting, WorkflowState)
-from tools.hardware import (ActionReport, DisabledHardwareBackend, RecordingFakeBackend,
+from tools.hardware import (ActionReport, DisabledHardwareBackend,
                             execute_acquisition, preflight)
 from tools.python_execution import fingerprint
 

@@ -4,8 +4,9 @@ import json
 from uuid import UUID, uuid5
 
 from agents.experimentor import ExecutionReview, UNRESOLVED_PREREQUISITES
-from state import Artifact, ExperimentProposal
-from tools.hardware import RecordingFakeBackend, Verification
+from workflow.state import Artifact, ExperimentProposal
+from fixtures.hardware import RecordingFakeBackend
+from tools.hardware import Verification
 from tools.python_execution import BackendReport, fingerprint
 
 
@@ -122,3 +123,88 @@ def offline_integrations(config, workflow_id: UUID, *, include_analyst: bool = F
     return {"scientist_model": FixtureScientistModel(), "experimentor_model": FixtureExperimentorModel(hardware),
             "hardware_backend": hardware, "execution_backend": FixtureExecutionBackend(),
             "analyst_model": FixtureAnalystModel() if include_analyst else None}
+
+
+# Synthetic bench agent doubles. These remain separate from the interface-only
+# Fixture* agents above; the synthetic backend and numerical tools execute normally.
+class LocalModel:
+    """Explicit local test doubles; optical acquisition and fitting remain real code."""
+    def with_structured_output(self, schema):
+        return self
+
+
+class LocalScientist(LocalModel):
+    def invoke(self, messages):
+        payload = json.loads(messages[1][1])
+        state = payload["workflow_state"]
+        if state["control"]["task"] == "interpretation":
+            latest = state["analyses"][-1]
+            metrics = latest["metrics"]
+            passed = bool(metrics.get("prediction_passed"))
+            return {"kind": "interpretation", "explanation": f"LOCAL TEST DOUBLE: held-out prediction {'passed' if passed else 'failed or is inconclusive'}; this is synthetic evidence, not laboratory validation.",
+                "recommended_next_step": "Inspect individual calibration and prediction artifacts",
+                "findings": [{"evidence_ids": [latest["id"]],
+                    "interpretation": f"Synthetic held-out prediction_passed={int(passed)}; measurement_passed={metrics.get('measurement_passed', 0)}.",
+                    "limitations": ["Local canned agent reasoning", "Uniform detector ROIs and ideal stable phase-only model", "Independent detector-row phase ambiguity"],
+                    "recommended_next_step": "Review evidence before improving the physical model"}]}
+        proposal = ExperimentProposal(scientific_question=state["user_request"],
+            hypothesis="A reference-free intensity fit can predict unseen phase-only detector readings",
+            rationale="Candidate approaches: GGS amplitude replacement or intensity least squares; both require diverse known phases, not measured complex fields",
+            variables={"approaches": "GGS or intensity least squares", "inputs": "Random phase-only SLM patterns"},
+            controls=["Same camera settings for fit and holdout", "Separate deterministic fit and held-out patterns"],
+            required_measurements=["Whole raw camera frames and mean ROI intensities"],
+            evaluation_criteria=["Held-out detector RMSE <=2 counts and NMSE <=0.02 with at least 8 usable readings per detector"],
+            assumptions=["Synthetic model only", "Uniform coherent detector ROIs"],
+            literature_references=[p["source_id"] for p in payload["literature_context"]])
+        return {"kind": "proposal", "explanation": "LOCAL TEST DOUBLE: propose GGS and intensity least squares as intensity-only candidates.",
+                "recommended_next_step": "Experimentor selects the reference GGS acquisition/evaluation procedure",
+                "proposals": [proposal.model_dump(mode="json")]}
+
+
+class LocalExperimentor(LocalModel):
+    def invoke(self, messages):
+        payload = json.loads(messages[1][1])
+        state = payload["workflow_state"]
+        if any(a["status"] in ("failed", "partial", "aborted") for a in state["acquisitions"]):
+            return {"kind": "request_information", "explanation": "LOCAL TEST DOUBLE: calibration/acquisition stopped; preserve diagnostics and do not automatically repeat.",
+                "recommended_next_step": "Inspect the saved calibration failure", "questions": ["Review model bounds and saved stopping reason before requesting another run."]}
+        cfg = state["control"]["configuration"]["optical_bench"]
+        proposal_id = state["control"]["active_proposal_ids"][0]
+        return {"kind": "procedure", "explanation": "LOCAL TEST DOUBLE: select reference-free GGS, acquire random phase-only patterns after calibration; no coherent reference or amplitude masking is used.",
+            "recommended_next_step": "Runner preflight, then exact human review/approval", "procedure": {
+                "proposal_id": proposal_id, "version": payload["next_procedure_versions"][proposal_id],
+                "actions": [{"action": "bench.acquire", "instruction": "Calibrate fixed pattern to whole-frame 3–5% saturation, freeze settings, acquire fit and held-out phase patterns",
+                    "requested_settings": {"shutter_seconds": {"value": cfg["shutter_seconds"], "unit": "s"},
+                        "laser_power_mw": {"value": cfg["laser_power_mw"], "unit": "mW"},
+                        "frame_budget": {"value": cfg["fit_patterns"] + cfg["holdout_patterns"] + cfg["calibration_attempts"], "unit": "frame"}}}],
+                "prerequisites": ["synthetic phase mapping verified"], "expected_outputs": ["Calibration diagnostics, raw frames, independent fit/holdout detector dataset"],
+                "output_subdirectory": "bench"}}
+
+
+class LocalAnalyst(LocalModel):
+    def invoke(self, messages):
+        payload = json.loads(messages[1][1])
+        before = payload["stage"] == "before_acquisition"
+        state = payload["workflow_state"]
+        metrics = state["analyses"][-1]["metrics"] if not before else {}
+        return {"stage": payload["stage"], "status": "advised" if before else "reviewed",
+            "proposal_ids": payload["proposal_ids"], "analysis_ids": payload["analysis_ids"],
+            "evidence_ids": payload["proposal_ids"] if before else payload["analysis_ids"],
+            "explanation": "LOCAL TEST DOUBLE: require separate holdout, clipped-fit exclusion and row-phase ambiguity." if before else
+                f"LOCAL TEST DOUBLE: measurement_passed={metrics.get('measurement_passed')}, prediction_passed={metrics.get('prediction_passed')}; inspect per-detector usable counts and held-out errors.",
+            "recommendations": ["Use bench.retrieve on saved raw frames; do not use hidden fields or truth" if before else "Keep workflow completion distinct from measurement and prediction quality"],
+            "limitations": ["Local canned agent reasoning; synthetic model only"]}
+
+
+class LocalRouter(LocalModel):
+    def invoke(self, messages):
+        context = json.loads(messages[1][1])
+        actions = context["available_actions"]
+        latest = context["latest_agent_outcome"]
+        if latest.get("kind") in ("acquisition_failed", "request_information"):
+            order = ["request_information"]
+        else:
+            order = ["conclude", "run_operation", "review_results", "interpret", "advise", "preflight", "prepare_procedure", "propose", "request_information"]
+        selected = next(a for kind in order for a in actions if a["kind"] == kind)
+        return {"action_id": selected["id"], "record_ids": selected["record_ids"],
+            "reason": "LOCAL TEST DOUBLE: " + (latest.get("explanation", "Stopped acquisition; inspect diagnostics") if selected["kind"] == "request_information" else selected["description"])}

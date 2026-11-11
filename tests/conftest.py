@@ -2,8 +2,8 @@
 
 import pytest
 
-from config import AppConfig
-from state import AcquisitionResult, Artifact, ExperimentProposal, Setting, WorkflowState
+from workflow.config import AppConfig
+from workflow.state import AcquisitionResult, Artifact, ExperimentProposal, Setting, WorkflowState
 
 
 @pytest.fixture

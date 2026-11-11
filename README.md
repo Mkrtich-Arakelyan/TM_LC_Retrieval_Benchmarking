@@ -15,18 +15,106 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-`state.py` defines records; `config.py` loads optional configuration;
-`architecture.txt` describes the provisional setup outside future agent prompts.
+`workflow/state.py` defines records; `workflow/config.py` loads optional configuration;
+`configs/architecture.txt` describes the provisional setup outside future agent prompts.
 `agents/scientist.py`, `agents/experimentor.py`, and `agents/runner.py` implement the agents;
 `agents/common.py` shares the chat-model protocol and architecture reader.
 `tools/python_execution.py` validates artifacts and records execution attempts.
 `tools/tm_numerics.py` provides reviewed offline dataset validation and reference-free
-TM fits; `tools/numerical_fixture.py` reproduces their real saved-data workflow.
-`tools/hardware.py` implements deterministic preflight and acquisition recording.
-`agents/orchestrator.py` contains routing rules; `graph.py` implements the LangGraph
-workflow and local persistence; `main.py` provides start/inspect/resume commands.
-`papers/` is reserved for original
-PDFs. Tests require no PDFs, credentials, network, or hardware.
+TM fits through `analysis/`; `checks/numerical.py` reproduces their real saved-data workflow.
+`main.py` is the primary CLI for general, fixture, saved-data, and explicitly
+selected synthetic optical bench workflows. Supplied paper excerpts live
+with the synthetic setup context in `bench/workflow.py`. See
+[Optical bench guide](docs/optical-bench.md) for simulation, calibration, approval, artifacts,
+and the standalone interference check. Simulation always requires explicit
+`--simulate`; it never selects physical hardware automatically.
+
+Primary commands (PowerShell, from the project root):
+
+```powershell
+.\.venv\Scripts\python.exe main.py --db data/bench.sqlite start --simulate --test-agents --bench-config configs/bench-normal.json --output outputs/bench
+.\.venv\Scripts\python.exe main.py --db data/bench.sqlite show WORKFLOW_ID
+.\.venv\Scripts\python.exe main.py --db data/bench.sqlite review WORKFLOW_ID approve --simulate --fingerprint REVIEW_FINGERPRINT --reviewer "Your name"
+.\.venv\Scripts\python.exe main.py --db data/bench.sqlite start --reuse-data-from WORKFLOW_ID --output outputs/reanalysis
+```
+
+The first command pauses with zero acquisitions. Inspect its exact review before
+approval. Continue simulations with `--simulate`; saved backend, settings and agent
+mode are retained. Omit `--test-agents` on the initial command for configured live
+agents. Saved-data reuse disables acquisition and retains a source bench's model
+mode, including local doubles. General `start "Question"`, `--fixture`, trusted
+`--factory`, and `follow-up` commands remain available.
+
+## Project layout
+
+```text
+main.py                    Primary CLI
+README.md, requirements.txt
+.env.example, .gitignore    Maintained root configuration
+.env                       Local credentials (ignored)
+agents/                    Scientist, Experimentor, Runner, Analyst, orchestrator
+workflow/
+  graph.py, state.py       Workflow graph and shared checkpoint records
+  config.py, llm.py        Application settings and live model construction
+  routing_catalog.py      Available-action discovery
+  persistence.py          Writer locking, saved references and progress persistence
+  report.py               Workflow, decision-log and quality exports
+tools/
+  hardware.py             Runner acquisition execution boundary
+  tm_numerics.py          Reviewed bench.retrieve and tm.* operation dispatch
+  python_execution.py     Injected Python execution interface
+bench/
+  optical_bench.py         Optical model and simulated backend adapter
+  acquisition.py          Calibration and frame acquisition sequence
+  config.py, plots.py      Synthetic settings and inspection plots
+  workflow.py             Question, paper context, setup, integration factories
+analysis/
+  bench_analysis.py        Bench retrieval and held-out evaluation
+  datasets.py, metrics.py  Dataset validation/loading and numerical metrics
+  tm_analysis.py           Saved-data TM operation implementation
+  tm_solvers.py            Shared fitting and bounded archive loading
+fixtures/
+  offline.py, hardware.py  Agent/execution doubles and recording backend
+  numerical.py, router.py  Shared numerical fixtures and routing doubles
+checks/
+  interference.py          Standalone camera interference check
+  numerical.py             Saved-data numerical workflow check
+  router.py                Routing and approval safety checks
+configs/
+  architecture.txt        Provisional general-workflow setup
+  bench-*.json            Reusable synthetic starting conditions
+docs/
+  optical-bench.md         Simulator, calibration, approval and artifact guide
+tests/, papers/           Tests and supplied literature
+```
+
+`tools/` contains the interfaces through which the workflow executes actions.
+Supporting implementations belong in the packages above. All imports use those
+packages directly; obsolete forwarding modules have been removed from `tools/`.
+Live model construction, local test doubles, and the simulated optical backend
+remain distinct.
+
+New workflows use `bench.workflow:build_integrations` (or the acquisition-disabled
+`bench.workflow:build_model_integrations` for saved-data reuse). Historical factory
+strings are translated to these paths by
+`workflow.persistence.canonical_factory_path` when the CLI or graph loads them;
+this preserves saved-workflow loading without the old modules.
+
+Preferred standalone commands are `python -m checks.interference`,
+`python -m checks.numerical`, and `python -m checks.router`. Their existing
+`--output` arguments are unchanged. Use these package commands in place of the
+removed `tools.*` check entry points. All workflow commands use `main.py`.
+
+Configuration reads the repository-root `.env` by default, independently of the
+working directory; explicit dotenv paths and environment precedence are unchanged.
+General startup and saved-data reuse share `configs/architecture.txt` as their
+default; `--architecture PATH` remains an explicit override. On context reads,
+only the exact former repository-root `architecture.txt` path is redirected.
+Custom paths and generated simulation contexts are preserved.
+
+New live workflows select `workflow.llm:build_integrations`. The factory-path
+translator also accepts the historical `llm:build_integrations` string and the
+historical bench factory strings, without restoring old import modules.
 
 ## Responsibilities and handoffs
 
@@ -39,10 +127,11 @@ PDFs. Tests require no PDFs, credentials, network, or hardware.
   code and analyzes saved data into `NumericalAnalysisResult`. No direct hardware access.
 - Runner: enforces preflight and exact human approval, owns the hardware backend
   boundary, and records progress, actual settings, raw-data references, cleanup,
-  and failures. Its provided backend is a test-only fixture; future laboratory
-  backends will own physical connections.
-- Orchestrator: deterministically routes proposals, revisions, analysis, questions,
-  human decisions, and stopping conditions; it does not require another model.
+  and failures. Provided backends include a test-only interface fixture and an
+  explicitly selected synthetic optical bench; laboratory backends own physical connections.
+- Orchestrator: optionally uses a routing LLM for scientific next-step choices from
+  a Python-owned action catalog. Preflight, human approval, execution, budgets and
+  recovery remain Python responsibilities. Legacy and fixture runs retain deterministic routing.
   `WorkflowState` connects all records to the original request and workflow status;
   `ConversationEntry` stores readable messages with record links.
 
@@ -89,8 +178,10 @@ output configuration, and budgets.
 
 ## Configuration
 
-Call `AppConfig.from_env()` explicitly. Importing does not load credentials, create
-directories, or contact a provider. No paid model or provider is selected.
+Call `AppConfig.from_env()` explicitly (the CLI does this). It reads `.env` at the
+repository root, then applies process environment overrides. Importing does not load
+credentials, create directories, or contact a provider. No provider/model is
+selected until you configure one.
 
 | Environment variable | Default |
 | --- | --- |
@@ -116,14 +207,146 @@ directories, or contact a provider. No paid model or provider is selected.
 | `TM_HARDWARE_ACTION_TIMEOUT_SECONDS` | `60`; cooperative action/cleanup deadline |
 | `TM_HARDWARE_RUN_TIMEOUT_SECONDS` | `600`; cooperative total deadline |
 
-Use environment variables for credentials; never commit secrets. `.env` is ignored
-but is not automatically loaded. The Experimentor enforces model-call and
+Use `.env` or environment variables for credentials; never commit secrets. `.env`
+and `.env.*` are ignored; the blank `.env.example` is safe to commit. The Experimentor enforces model-call and
 execution-attempt limits; timeout is passed to the test backend and over-limit
 reports are rejected. Global optical equipment limits remain explicitly unknown.
 Runner limits come only from a trusted backend's verified capability snapshot,
 never the provisional architecture file. Fixture constraints apply only to tests.
 
 ## Calling the Scientist
+
+### Connecting a live LLM
+
+Install/update dependencies once:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Fill the local `.env` file (or copy `.env.example` if it is missing):
+
+```dotenv
+TM_LLM_PROVIDER=openai
+TM_LLM_MODEL=your-api-model-id
+TM_API_KEY=your-api-key
+TM_REVIEWED_NUMERICS_ENABLED=true
+```
+
+Set provider to `gemini` for the Gemini Developer API; use its model ID and API key.
+Use API credentials, not a ChatGPT/Gemini chat-app login. No particular model family
+is required: choose a text chat model supporting JSON object output with enough
+context for the setup, record schemas, and workflow history. Scientific reasoning
+and reliable instruction following matter; the model does not perform the matrix
+fits itself. Review its scientific conclusions as usual. Model access and pricing
+depend on your provider account.
+
+Start the normal workflow without `--fixture` or a custom factory:
+
+```powershell
+.\.venv\Scripts\python.exe main.py start "Prepare a plan to compare reference-free TM retrieval methods"
+```
+
+The built-in adapter configures Scientist, Experimentor, and Analyst with the same
+model. It requests JSON and validates each response against the existing Pydantic
+schema. Full schemas are supplied as instructions because the records include
+flexible setting dictionaries outside strict provider schema subsets. JSON syntax
+mode is not a guarantee of schema correctness: malformed, refused, truncated, or
+schema-invalid answers fail validation; there is no silent response repair or
+provider/model fallback. Clients use a 120-second request timeout and at most two
+SDK retries. No temperature is forced. No provider tools are enabled.
+
+The Analyst receives an explicit response contract containing the exact target
+UUIDs. A malformed response, altered target ID or missing required evidence ID gets
+one model correction attempt with validation feedback. References are never silently
+rewritten. A second invalid answer blocks the workflow; successful corrections and
+their initial validation error are recorded in the Analyst message. Acquisition and
+evidence eligibility checks still apply before a review can be saved.
+
+### Routing LLM
+
+`main.py start --reuse-data-from WORKFLOW_ID` enables `llm_router_enabled`
+for paper-context analysis of completed saved acquisitions. Acquisition and generated
+code remain disabled. The built-in provider uses the same API key and model for
+`Integrations.router_model`; programmatic callers can inject their own router.
+
+`agents/orchestrator.py` supplies one router prompt and validates `RouterChoice`.
+`workflow/routing_catalog.py` builds actions from available agents, verified saved-data
+manifests, current capabilities and remaining budgets. It has adapters for the three
+reviewed TM operations; it does not match phrases in research questions. Additional
+reviewed tools can add catalog adapters and an execution handler without adding a
+branch for a particular question. Python chooses what can be offered; the routing
+LLM chooses among those offered actions using scientific context.
+
+The compact input contains the research question, latest agent outcome, recent human
+clarifications, active proposal summaries, validated dataset dimensions/provenance/
+splits and fingerprints, eligible completed results, capabilities, limitations and
+concrete action IDs. It excludes arrays, secrets and the full conversation. The model
+returns an `action_id`, optional relevant `record_ids`, and a short reason. Leaving
+`record_ids` empty is allowed: Python supplies the exact immutable bindings from the
+chosen action, avoiding model transcription of long UUIDs. Any supplied IDs must
+belong to that action. Stale or changed bindings are rejected on a second catalog check.
+
+Permitted scientific choices include proposing/revising a scientific plan, Analyst
+advice/review, preparing/revising a procedure, requesting preflight, running an offered
+named operation, interpretation, clarification, or accepting a recorded Scientist
+conclusion. No approval, direct acquisition, generated source, arbitrary function,
+module import or shell command is a routing action. Even a valid preflight selection
+only reaches Runner checks and human review. Only the existing exact-review human
+approval can reach acquisition, which Runner revalidates as before. The paper-context launcher keeps acquisition disabled.
+
+Each router turn is a LangGraph node with existing step limits. Chosen actions and
+record bindings are checkpointed before the executor node; numerical/acquisition
+attempt limits, durable execution receipts, no-blind-replay policy and approval
+fingerprints remain in force. Invalid/malformed choices are recorded as rejected,
+the workflow blocks with a clear error, and saved data/results remain intact. There
+is no automatic deterministic fallback after a bad router response. Correct the issue
+and use the existing launcher `--resume WORKFLOW_ID`; clarification, approval and
+reconciliation use their existing explicit commands.
+
+Decisions are stored in `WorkflowState.router_decisions` in SQLite and exported under
+the printed `outputs/runs/WORKFLOW_ID/` directory:
+
+- `router-decisions.md`: ordered accepted/rejected decisions and reasons.
+- `router-decisions.json`: decisions, bound IDs and the compact context/action catalog
+  shown to the model, so its available options can be inspected.
+- `agent-messages.md` and `workflow.json`: decisions alongside agent messages and records.
+
+Programmatic callers opt in with `AppConfig(llm_router_enabled=True)` and
+`Integrations(router_model=...)`; the built-in provider factory constructs this slot
+when enabled. `TM_LLM_ROUTER_ENABLED=true` also enables it for new CLI configurations.
+`--fixture` forces deterministic routing and never invokes a routing LLM, even with
+live credentials/configuration present. Older runs without this flag retain their
+original routing rather than silently changing a saved experiment.
+
+Reproduce the routing checks:
+
+```powershell
+.\.venv\Scripts\python.exe -m checks.router
+.\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
+```
+
+The harness uses the same test-double router with existing algebraic data, missing
+data with a recording test backend, and missing data without a backend. It checks
+invalid action rejection and zero acquisition calls without matching approval.
+`--live` explicitly invokes only the configured router for these scenarios; the
+acquisition capability is still a test fixture. Other agent calls and safety checks
+use existing canned fixtures. It writes results beneath `outputs/router-check/`.
+The tests cover wrong IDs, stale capabilities, checkpoint reopening, budgets and
+fixture mode without live API calls.
+
+Explicitly injected integrations and `--factory` still take priority. Clients are
+created lazily; offline fixture mode uses canned models even if `.env` has live
+settings. Loading configuration does not modify the process environment or expand
+`${...}` inside credentials. Environment variables override `.env`, including empty
+values. Secrets are excluded from saved configuration; resume reads the key from
+the current process configuration. A resumed workflow retains its saved model name
+unless `resume --refresh-config` is requested. `show` needs no API call.
+
+The `.env` template enables only reviewed offline numerical operations. Hardware
+and arbitrary generated-code execution remain disabled. The fixture command below
+remains the deterministic offline numerical demonstration; a new workflow needs
+saved registered data before it can analyze measurements.
 
 Supply a chat model supporting `with_structured_output(PydanticModel).invoke(messages)`.
 This follows the [LangChain structured-output interface](https://reference.langchain.com/python/langchain-core/language_models/chat_models/BaseChatModel/with_structured_output).
@@ -134,7 +357,7 @@ uses the supplied model, so its networking and credentials are the caller's conc
 
 ```python
 from agents.scientist import scientist
-from state import LiteraturePassage, WorkflowState
+from workflow.state import LiteraturePassage, WorkflowState
 
 def propose(chat_model):  # externally configured model; a fake also works
     state = WorkflowState(user_request="Compare TM retrieval methods at equal measurement budgets")
@@ -189,16 +412,16 @@ analysis scripts, reviews execution diagnostics, and repairs technical code issu
 within configured limits. It requests essential information or Scientist decisions
 instead of changing scientific controls, budgets, assumptions, or hypotheses.
 It has no hardware connection, approval, acquisition, or scientific-finding tools.
-The injected model uses the same interface as the Scientist; no dependencies or
-provider clients were added.
+The injected model uses the same interface as the Scientist. Provider clients are
+configured separately by `workflow/llm.py` or a custom integration factory.
 
 To prepare a procedure, supply a state containing the Scientist's proposal and a
 request describing the desired technical work:
 
 ```python
 from agents.experimentor import experimentor
-from config import AppConfig
-from state import WorkflowState
+from workflow.config import AppConfig
+from workflow.state import WorkflowState
 
 def prepare_procedure(chat_model, proposal):
     state = WorkflowState(
@@ -381,10 +604,10 @@ obtain a human decision. No physical observations or calibration are generated.
 from hashlib import sha256
 from pathlib import Path
 
-from config import AppConfig
-from state import (AcquisitionAction, Artifact, ExperimentProcedure, HumanApproval,
+from workflow.config import AppConfig
+from workflow.state import (AcquisitionAction, Artifact, ExperimentProcedure, HumanApproval,
                    Setting, WorkflowState)
-from tools.hardware import RecordingFakeBackend
+from fixtures.hardware import RecordingFakeBackend
 
 def approved_fake_fixture(scientist_proposal):
     inputs = Path("data/fake-input").resolve()
@@ -591,13 +814,14 @@ Normal mode never substitutes fixtures:
 # Returns blocked with an unconfigured-model explanation until integrations exist.
 ```
 
-Programmatic applications inject `graph.Integrations(scientist_model=...,
+Programmatic applications inject `workflow.graph.Integrations(scientist_model=...,
 experimentor_model=..., hardware_backend=..., execution_backend=...)` into
 `WorkflowApp(config, integrations)`. The chat models use the existing structured
 output contract. For the CLI, `--factory package.module:build` loads an explicitly
-selected trusted function `build(config) -> graph.Integrations`; provide it on each
+selected trusted function `build(config) -> workflow.graph.Integrations`; provide it on each
 process invocation requiring integrations. That function configures external
-clients; this repository selects no provider or paid model. Secrets can come from
+clients. Without explicit integrations or a factory, configured LLM settings select
+the built-in `workflow.llm:build_integrations` factory described below. Secrets can come from
 environment variables or in-memory `config.api_key` and are excluded from saved
 configuration. Normal numerical execution and physical hardware remain unavailable
 until their separately verified backends are implemented.
@@ -619,6 +843,13 @@ their historical snapshots. Model clients and backend objects are not serialized
 and must be supplied again by an application/factory. Explicit fixture mode is
 remembered and can reconstruct its deterministic test integrations on restart.
 SQLite databases, journals, and local lock files are ignored by Git.
+
+Factory-created integrations are cached by workflow UUID and factory path for the
+lifetime of one `WorkflowApp`. Different workflows therefore receive backends built
+from their own saved configuration; returning to a workflow reuses its services.
+Explicitly injected `Integrations` retain their caller-owned shared lifetime.
+`workflow/persistence.py` owns the writer lock and atomic analysis-progress
+file operation; checkpoint-aware recovery and routing remain in `workflow/graph.py`.
 
 Checkpoint durability is synchronous. Step/attempt reservations and the acquisition
 UUID are committed before side-effect nodes run. A node containing an interrupt
@@ -680,16 +911,52 @@ warnings; no hosted tracing service is needed by these tests.
 
 ### Reviewed offline TM numerical operations
 
+#### Shared CLI, paper context and backend integration
+
+`main.py` owns workflow command handling. `bench/workflow.py` retains the supplied `HUANG-S2`
+and `RAFAYELYAN-APP-A` excerpts, research questions, model setup and factory paths.
+It does not parse PDFs. Run `python main.py start --reuse-data-from WORKFLOW_ID`
+to analyze completed registered acquisitions with reviewed numerical operations.
+Use `--db PATH` consistently for workflows in another checkpoint database.
+`show`, `resume`, `clarify` and `cancel` retain their workflow roles.
+Use `--simulate` consistently when approving/resuming a synthetic bench workflow;
+saved-data execution accepts backend-disabled workflows.
+
+The old optical simulator remains removed. The new bench is selected explicitly
+with `--simulate` and uses `optical_bench` settings and the `simulated` backend tag.
+General workflows retain their configured integrations; simulation always requires
+explicit `--simulate` selection and never falls back to physical acquisition. Old checkpoints with removed backend configuration can be
+inspected using `main.py show WORKFLOW_ID`, but cannot be resumed as acquisition workflows.
+Past experiment files remain unchanged. Registered dataset manifests remain
+usable by the shared numerical analysis tools, including simulated provenance.
+
+The synthetic bench implements `tools.hardware.HardwareBackend` and is
+explicitly injected through `workflow.graph.Integrations.hardware_backend` (or the
+trusted `main.py --factory module:function` integration factory), with explicit
+configuration and setup context. The shared Runner owns preflight, exact-review
+approval, budgets, cancellation and acquisition journals. Saved arrays/manifests
+connect to `tools.tm_numerics`; tool discovery belongs in
+`workflow.routing_catalog`. There is no automatic physical-hardware fallback.
+
+The acquisition call path is `WorkflowApp` preflight/acquire nodes →
+`agents.runner.runner` → `tools.hardware.preflight` / `execute_acquisition` →
+the explicitly supplied backend. `agents.orchestrator` and the routing catalog
+choose workflow actions; they do not construct acquisition backends. Without an
+injected backend the shared hardware boundary uses `DisabledHardwareBackend`.
+The paper launcher keeps its literature passages and agent setup separate from
+this boundary. It starts new synthetic runs only with `--simulate`; saved-data
+reuse starts from completed saved acquisitions.
+
 One real saved-data path now implements `I = abs(X @ T.T)**2`, with input patterns
-as rows `X[N,D]`, camera output channels as columns `I[N,M]`, and `T[M,D]`. NumPy
-is the only added numerical dependency. These are fixed reviewed Python functions,
+as rows `X[N,D]`, camera output channels as columns `I[N,M]`, and `T[M,D]`. These
+shared calculations use NumPy; the bench inspection plots use Matplotlib. These are fixed reviewed Python functions,
 not an optical simulator, generated-code sandbox, or hardware adapter.
 
 Reproduce the complete saved-data request → reviewed calculation → Analyst review
 workflow with one command after installing requirements:
 
 ```powershell
-.\.venv\Scripts\python.exe -m tools.numerical_fixture --output outputs/numerical-check
+.\.venv\Scripts\python.exe -m checks.numerical --output outputs/numerical-check
 ```
 
 Each invocation creates a fresh case directory with a deterministic algebraic
@@ -744,9 +1011,11 @@ The fitting data archive rejects embedded ground truth.
 
 #### Named requests and workflow
 
-`AnalysisRequest.operation` accepts only `tm.validate_dataset` or
-`tm.compare_reference_free`. The former writes a validation report; the latter
-fits both methods and evaluates them on the same final holdout. No function name,
+`AnalysisRequest.operation` accepts `tm.validate_dataset`, `tm.compare_reference_free`,
+`tm.evaluate_saved_predictions`, or the synthetic bench's `bench.retrieve`.
+Validation writes a report; comparison fits both
+methods and evaluates them on the same final holdout. Saved-prediction evaluation
+scores an existing completed reviewed comparison without fitting. No function name,
 module import, shell text, or Python source supplied by a model is executed.
 
 `Artifact` now includes a stable UUID `id`. Requests name `dataset_artifact_id` and
@@ -761,7 +1030,7 @@ across restarts.
 Example Analyst request (UUIDs must come from the actual state):
 
 ```python
-from state import AnalysisRequest, TMFitSettings
+from workflow.state import AnalysisRequest, TMFitSettings
 request = AnalysisRequest(
     calculation="Compare reference-free retrieval with final held-out prediction errors",
     operation="tm.compare_reference_free",
@@ -833,8 +1102,10 @@ Each execution writes new artifacts under the workflow analysis directory:
 - `report.json`: source manifest/hash, origin/provenance, splits, seed/settings,
   fit-loss trajectories, stopping reasons, selected restart/iterate, normalization,
   shared initialization cost, per-method fitting runtime and scalar metrics.
-- `reviewed_implementation.py`: hashed audit copy of the fixed implementation; this
-  copy is never imported/executed as a generated script.
+- `reviewed_implementation.py`: hashed audit copy of the dispatch interface, with
+  dependency hashes for the relocated implementations in `reviewed_sources/`; these
+  snapshots are never imported/executed as generated scripts. The bench-specific
+  `reviewed_bench_analysis.py` copy is retained.
 
 The existing `NumericalAnalysisResult` stores input artifacts, reviewed code hash,
 settings/seed, execution diagnostics, origin, output artifact IDs/hashes and finite
@@ -847,11 +1118,24 @@ matrix error is omitted for all-zero ground truth. Runtime is observational and 
 vary across machines, while seeded estimates/settings should be reproducible in the
 same numerical environment. Raw input files are not overwritten.
 
+Comparison and saved-prediction evaluation also report measured holdout RMSE (square
+root of MSE) and MAE (mean absolute residual). With separate truth, `holdout_noiseless_*`
+scores compare against `abs(X_holdout @ T_true.T)**2`, distinguishing latent brightness
+error from noisy observation error. `intensity_ls_minus_ggs.*` records paired metric
+differences; a negative difference favors intensity least squares for that score.
+Evaluation requests reference the original completed comparison ID and its dataset/
+truth artifact IDs, retaining its exact fit settings. Saved output hashes, output-root
+containment, matrix/prediction consistency and holdout indices are checked. Matrices
+and predictions are reused unchanged; retained method runtimes are the original fit
+runtimes, and total runtime measures the evaluation operation. New reports record
+source analysis IDs and `fit_reused`. Callers can request this reviewed operation
+without generating analysis code.
+
 Tests include a complex directional finite-difference gradient check, independent
 row-phase alignment, holdout/truth isolation, real workflow dispatch, malformed data,
 pairing/splits, nonfinite values, rank, hashes/IDs, provenance and disabled execution.
-The full optical simulation, physical adapter and general-purpose sandbox remain
-outside this milestone.
+Full optical realism, a physical adapter and a general-purpose sandbox remain
+outside these shared numerical operations; the small synthetic bench is documented separately.
 
 ### Optional Analyst handoffs
 
@@ -903,7 +1187,7 @@ for Scientist findings.
 
 Provenance is derived from source acquisitions: physical, simulated, test-only,
 mixed or unknown. `HardwareExecution.data_origin` accepts an explicit simulated tag
-for imported metadata; no simulator or simulated backend was added. Missing provenance
+for imported metadata and synthetic bench acquisitions. Missing provenance
 produces an unknown label and limitation. Metadata checks cannot prove every prose
 claim, validation independence, or scientific validity. Fixture reviews and tests
 verify software contracts, not reasoning quality or numerical correctness.
@@ -921,12 +1205,12 @@ comparative metrics and saved outputs; the broader items remain future work:
 - Provenance auditing and structured calculation execution through a verified isolated
   backend, retaining scripts, parameters, seeds, logs and output artifacts.
 
-Digital simulation, richer data/preprocessing tools, uncertainty estimators and
-physical hardware remain later milestones. The basic reviewed numerical path above
-is implemented and executes real calculations.
+The small synthetic workflow bench is now available; richer physical simulation,
+data/preprocessing tools, uncertainty estimators and physical hardware remain future
+work. The reviewed numerical paths execute real local calculations.
 
 Confirm laboratory equipment, limits, calibration, and setup description. Later
 steps will add literature retrieval, a verified isolated numerical backend, and a
-verified laboratory harness. There is no RAG,
-PDF ingestion, embeddings, search, simulator, hardware driver, or scientific benchmark
-demonstration. Physical hardware behavior remains untested.
+verified laboratory harness. There is no RAG, PDF ingestion, embeddings, search,
+hardware driver, or laboratory scientific benchmark demonstration.
+Physical hardware behavior remains untested.

@@ -15,8 +15,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from config import AppConfig
-from state import (AcquisitionAction, AcquisitionResult, AcquisitionReview, ActionProgress,
+from workflow.config import AppConfig
+from workflow.state import (AcquisitionAction, AcquisitionResult, AcquisitionReview, ActionProgress,
                    Artifact, ExperimentProcedure, HardwareExecution, HumanApproval,
                    Setting, Text, approval_matches)
 from tools.python_execution import contained_file, fingerprint
@@ -39,6 +39,7 @@ class ActionSpec(BaseModel):
     required_calibrations: list[Text] = Field(default_factory=list)
     required_prerequisites: list[Text] = Field(default_factory=list)
     measurement_count_setting: Text | None = None
+    measurement_count_multiplier: int = Field(default=1, ge=1, le=1000)
 
 
 class Verification(BaseModel):
@@ -52,7 +53,7 @@ class HardwareCapabilities(BaseModel):
     backend_id: Text
     revision: Text
     available: bool = False
-    data_origin: Literal["physical", "test_only"]
+    data_origin: Literal["physical", "simulated", "test_only"]
     actions: dict[Text, ActionSpec] = Field(default_factory=dict)
     prerequisites: dict[Text, Verification] = Field(default_factory=dict)
     verified_calibrations: dict[Text, Artifact] = Field(default_factory=dict)
@@ -141,13 +142,16 @@ def parameter_issues(settings: dict[str, Setting], spec: ActionSpec) -> list[str
 
 
 def hardware_configuration(config: AppConfig) -> dict:
-    return {"backend": config.hardware_backend,
+    settings = {"backend": config.hardware_backend,
             "input_root": str(config.hardware_input_path.resolve()),
             "run_root": str((config.run_output_path / "acquisitions").resolve()),
             "max_actions": config.max_acquisition_actions,
             "max_measurements": config.max_acquisition_measurements,
             "action_timeout_seconds": config.hardware_action_timeout_seconds,
             "run_timeout_seconds": config.hardware_run_timeout_seconds}
+    if config.hardware_backend == "simulated" and config.optical_bench is not None:
+        settings["optical_bench"] = config.optical_bench.model_dump(mode="json")
+    return settings
 
 
 def preflight(procedure: ExperimentProcedure, config: AppConfig,
@@ -173,6 +177,8 @@ def preflight(procedure: ExperimentProcedure, config: AppConfig,
         issues.append("Hardware backend is unavailable")
     if cfg.hardware_backend == "test" and caps.data_origin != "test_only":
         issues.append("Test configuration cannot operate a physical backend")
+    if cfg.hardware_backend == "simulated" and caps.data_origin != "simulated":
+        issues.append("Simulated configuration requires an explicitly simulated backend; physical fallback is forbidden")
     if not caps.supports_deadlines or not caps.supports_cancellation:
         issues.append("Backend has not verified bounded execution and cancellation support")
     if cfg.max_acquisition_actions is not None and len(proc.actions) > cfg.max_acquisition_actions:
@@ -193,7 +199,7 @@ def preflight(procedure: ExperimentProcedure, config: AppConfig,
             if count is None or type(count.value) is not int or count.value < 0:
                 issues.append(f"Action {index}: unknown measurement budget")
             else:
-                measurements += count.value
+                measurements += count.value * spec.measurement_count_multiplier
         elif cfg.max_acquisition_measurements is not None:
             issues.append(f"Action {index}: no verified measurement budget definition")
     if cfg.max_acquisition_measurements is not None and measurements > cfg.max_acquisition_measurements:
@@ -300,7 +306,8 @@ def execute_acquisition(
         data_origin=caps.data_origin, run_directory=str(directory), started_at=_utcnow(),
         actions=[ActionProgress(index=i, requested=a.model_copy(deep=True)) for i, a in enumerate(proc.actions)])
     record = AcquisitionResult(id=attempt_id, procedure_id=proc.id, procedure_version=proc.version,
-        procedure_fingerprint=proc.fingerprint(), status="started", hardware=hardware_record)
+        procedure_fingerprint=proc.fingerprint(), status="started", data_origin=caps.data_origin,
+        hardware=hardware_record)
     record_path = directory / "record.json"
     _save_record(record_path, record)
     cancellation = cancel_event if cancel_event is not None else Event()
@@ -389,54 +396,3 @@ def execute_acquisition(
     _save_record(record_path, record)
     return HardwareRunResult(review=current, acquisition=record,
                              issues=list(record.errors))
-
-
-class RecordingFakeBackend:
-    """TEST ONLY: deterministic fixture files, never physical observations."""
-    def __init__(self, calibration: Artifact, *, fail_at: int | None = None):
-        self.capabilities = HardwareCapabilities(
-            backend_id="recording-fake-test-only", revision="1", available=True,
-            data_origin="test_only", supports_deadlines=True, supports_cancellation=True,
-            supports_cleanup=True,
-            prerequisites={"fixture setup verified": Verification(verified=True, evidence="test fixture only")},
-            verified_calibrations={"fixture-calibration": calibration.model_copy(deep=True)},
-            actions={"fixture.capture": ActionSpec(parameters={"count": ParameterSpec(
-                kind="integer", unit="frame", verified=True, minimum=1, maximum=4)},
-                required_calibrations=["fixture-calibration"],
-                required_prerequisites=["fixture setup verified"], measurement_count_setting="count")})
-        self.fail_at = fail_at
-        self.execute_calls: list[AcquisitionAction] = []
-        self.cleanup_calls: list[str] = []
-
-    def describe(self) -> HardwareCapabilities:
-        return self.capabilities.model_copy(deep=True)
-
-    def validate(self, procedure: ExperimentProcedure) -> list[str]:
-        return []
-
-    def execute(self, action: AcquisitionAction, *, output_dir: Path,
-                input_artifacts: list[Artifact], capability_fingerprint: str,
-                deadline: float, cancel_event: Event) -> ActionReport:
-        if capability_fingerprint != canonical_hash(self.describe().model_dump(mode="json")):
-            return ActionReport(errors=["Fake capabilities changed"])
-        spec = self.capabilities.actions.get(action.action or "")
-        if spec is None:
-            return ActionReport(errors=["Unsupported fake action"])
-        if invalid := parameter_issues(action.requested_settings, spec):
-            return ActionReport(errors=invalid)
-        index = len(self.execute_calls)
-        self.execute_calls.append(action.model_copy(deep=True))
-        if cancel_event.is_set() or time.monotonic() >= deadline:
-            return ActionReport(aborted=True, errors=["Fake cancelled"])
-        if index == self.fail_at:
-            return ActionReport(errors=["Injected test-only acquisition failure"])
-        path = output_dir / "fixture.json"
-        with path.open("x", encoding="utf-8") as file:
-            json.dump({"data_origin": "test_only", "fixture_measurements": [0] * action.requested_settings["count"].value}, file)
-        return ActionReport(actual_settings={k: v.model_copy(deep=True) for k, v in action.requested_settings.items()},
-            raw_data=[Artifact(path=str(path), description="TEST ONLY deterministic fixture; not physical data",
-                               media_type="application/json")])
-
-    def cleanup(self, *, reason: str, deadline: float) -> str:
-        self.cleanup_calls.append(reason)
-        return "Test-only cleanup recorded; no physical equipment exists"

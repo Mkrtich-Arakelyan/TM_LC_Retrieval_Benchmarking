@@ -8,9 +8,11 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from agents.common import ChatModel, DEFAULT_ARCHITECTURE_PATH, NO_LITERATURE_NOTICE, read_context
-from state import AnalystReview, ConversationEntry, LiteraturePassage, WorkflowState
+from workflow.state import AnalystReview, ConversationEntry, LiteraturePassage, WorkflowState
 
 DEFAULT_SYSTEM_PROMPT = """You are the Analyst for LC-SLM TM retrieval benchmarking.
+When llm_router_enabled is true, your review and analysis requests inform a separate
+routing LLM; you do not dispatch agents or operations yourself.
 At before_acquisition, advise the Experimentor on measurements, controls, calibration
 inputs, validation/held-out data and feasible analysis. The camera records intensity;
 complex-field methods may need a coherent reference or additional measurements.
@@ -30,12 +32,37 @@ Return the requested stage and exact target proposal_ids/analysis_ids. Cite exis
 UUIDs in evidence_ids for run claims; artifact_paths must exactly match artifacts
 registered under cited/target records. These are metadata references, not inspected
 file contents. Do not invent IDs, paths, measurements, metrics, citations or tool output.
+Required evidence references, checked before your response is accepted:
+- For before_acquisition with status advised, evidence_ids must include EVERY UUID
+  in the supplied top-level proposal_ids, even though no measurements exist yet.
+  These references identify the proposals your advice addresses, not measured results.
+- For after_analysis with status reviewed, evidence_ids must include EVERY UUID
+  in the supplied top-level analysis_ids, and those analyses must be completed
+  with eligible completed upstream acquisitions.
+Copy the exact UUID strings from the supplied target lists. Putting an ID only in
+proposal_ids or analysis_ids does not count as citing it in evidence_ids. Literature
+source IDs belong in cited_source_ids and cannot replace these record UUIDs.
+The response_contract in the payload repeats the exact required values. Copy UUIDs
+verbatim; do not retype from memory, abbreviate, concatenate groups or add hyphens.
+If response_validation_feedback is supplied, your prior response was rejected;
+return one complete corrected review using the original records and exact IDs.
 If more calculation is necessary, return more_analysis with analysis_request describing
 the calculation and its existing input_record_ids/input_artifact_paths. It may use
-For reviewed tools, set operation to tm.validate_dataset or tm.compare_reference_free,
-dataset_artifact_id to the registered JSON manifest artifact UUID, optional
+For reviewed tools, set operation to tm.validate_dataset, tm.compare_reference_free,
+or tm.evaluate_saved_predictions (evaluate existing completed comparison outputs
+without refitting; input_record_ids must name the original comparison analysis).
+For a synthetic-bench-v1 dataset use bench.retrieve: reference-free GGS with
+fit-only selection, clipped-fit exclusion, held-out camera predictions and usable
+counts. Its measurement_passed and prediction_passed are separate from workflow
+completion. The true TM and internal fields are unavailable to agents.
+Set dataset_artifact_id to the registered JSON manifest artifact UUID, optional
 ground_truth_artifact_id to a separate registered NPZ, and parameters with iterations,
 restarts, seed, tolerance, step_size. These operations never execute generated code.
+Comparison results include holdout_mse/rmse/mae/nmse against measured intensities,
+holdout_noiseless_mse/rmse/mae/nmse against evaluation-only true brightness when truth
+exists, and intensity_ls_minus_ggs paired metric differences. Check the recorded
+metrics before requesting calculations already completed. Use reviewed saved-prediction
+evaluation for additional metrics on existing predictions.
 saved data only; missing measurements must be reported as needs_information, not ordered.
 Use needs_information with explicit questions for essential missing information.
 Use advised/reviewed only for completed advice/review, not as a claim that science is
@@ -78,14 +105,36 @@ def analyst(state: WorkflowState, model: ChatModel, *,
     payload = {"workflow_state": snapshot.model_dump(mode="json"), **context.model_dump(mode="json"),
                "stage": stage, "proposal_ids": list(map(str, proposals)), "analysis_ids": list(map(str, analyses)),
                "recorded_provenance": provenance}
-    try:
-        raw = model.with_structured_output(AnalystReview).invoke([
-            ("system", DEFAULT_SYSTEM_PROMPT), ("human", json.dumps(payload, ensure_ascii=False))])
-        review = AnalystReview.model_validate(raw.model_dump() if isinstance(raw, BaseModel) else raw)
-    except (ValueError, TypeError) as exc:
-        raise ValueError(f"Invalid Analyst model response: {exc}") from exc
-    if review.stage != stage or set(review.proposal_ids) != set(proposals) or set(review.analysis_ids) != set(analyses):
-        raise ValueError("Analyst response stage/targets do not match the requested review")
+    payload["response_contract"] = {
+        "stage": stage, "proposal_ids": payload["proposal_ids"], "analysis_ids": payload["analysis_ids"],
+        "required_evidence_ids_if_advised": payload["proposal_ids"],
+        "required_evidence_ids_if_reviewed": payload["analysis_ids"],
+    }
+    response_errors = []
+    # One bounded model correction for structural/target-reference mistakes. Never
+    # normalize, invent or silently replace references in an invalid response.
+    for attempt in range(2):
+        try:
+            raw = model.with_structured_output(AnalystReview).invoke([
+                ("system", DEFAULT_SYSTEM_PROMPT), ("human", json.dumps(payload, ensure_ascii=False))])
+            review = AnalystReview.model_validate(raw.model_dump() if isinstance(raw, BaseModel) else raw)
+            if review.stage != stage or set(review.proposal_ids) != set(proposals) or set(review.analysis_ids) != set(analyses):
+                raise ValueError("Analyst response stage/targets do not match the requested review")
+            required = proposals if review.status == "advised" else analyses if review.status == "reviewed" else []
+            if not set(required).issubset(review.evidence_ids):
+                raise ValueError("Analyst evidence_ids must include every target "
+                                 + ("proposal" if review.status == "advised" else "analysis") + " UUID")
+            if set(review.evidence_ids) - records.keys():
+                raise ValueError("Analyst cites missing evidence record IDs")
+            break
+        except (ValueError, TypeError) as exc:
+            if attempt == 1:
+                raise ValueError(f"Invalid Analyst model response after 2 attempts: {exc}") from exc
+            response_errors.append(str(exc))
+            payload["response_validation_feedback"] = {
+                "error": str(exc)[:2000],
+                "correction": "Return a complete corrected review. Copy exact UUID strings from response_contract; all original constraints still apply.",
+            }
     if set(review.cited_source_ids) - {p.source_id for p in context.literature_context}:
         raise ValueError("Unknown Analyst literature source identifiers")
     refs = set(review.evidence_ids) | set(proposals) | set(analyses)
@@ -129,13 +178,14 @@ def analyst(state: WorkflowState, model: ChatModel, *,
         if set(request.input_artifact_paths) - inputs:
             raise ValueError("Analysis request cites missing or unrelated input artifacts")
         if request.operation:
-            from tools.tm_numerics import registered_artifacts
+            from analysis.datasets import registered_artifacts
             artifacts, _ = registered_artifacts(snapshot, request.input_record_ids)
             if any(key not in artifacts for key in (request.dataset_artifact_id, request.ground_truth_artifact_id) if key):
                 raise ValueError("Named operation cites an unregistered artifact ID")
     if review.id in {r.id for group in (snapshot.analyst_reviews, snapshot.conversation,
         snapshot.proposals, snapshot.procedures, snapshot.acquisitions, snapshot.analyses,
-        snapshot.analysis_code, snapshot.findings, snapshot.approvals, snapshot.acquisition_reviews) for r in group}:
+        snapshot.analysis_code, snapshot.findings, snapshot.approvals, snapshot.acquisition_reviews,
+        snapshot.router_decisions) for r in group}:
         raise ValueError("Analyst response reuses an existing record ID")
     review.provenance = {str(k): provenance[str(k)] for k in refs if str(k) in provenance}
     for key, origins in review.provenance.items():
@@ -145,6 +195,8 @@ def analyst(state: WorkflowState, model: ChatModel, *,
         review.limitations.append(NO_LITERATURE_NOTICE)
     snapshot.analyst_reviews.append(review.model_copy(deep=True))
     message = review.model_dump_json(indent=2)
+    if response_errors:
+        message = "Analyst corrected its response after one validation retry. Rejected response error: " + response_errors[0] + "\n\n" + message
     snapshot.conversation.append(ConversationEntry(role="analyst", message=message,
         record_ids=[review.id, *review.evidence_ids], scientific_context=context))
     return AnalystResult(outcome=review, state=snapshot)

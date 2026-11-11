@@ -7,10 +7,10 @@ from uuid import uuid4
 import pytest
 
 from agents.analyst import DEFAULT_SYSTEM_PROMPT, analyst
-from config import AppConfig
-from graph import Integrations, WorkflowApp
-from state import Artifact, HardwareExecution, NumericalAnalysisResult, WorkflowState
-from tools.offline_fixtures import FixtureAnalystModel, offline_integrations
+from workflow.config import AppConfig
+from workflow.graph import Integrations, WorkflowApp
+from workflow.state import Artifact, HardwareExecution, NumericalAnalysisResult, WorkflowState
+from fixtures.offline import FixtureAnalystModel, offline_integrations
 
 
 class FakeAnalyst(FixtureAnalystModel):
@@ -50,6 +50,41 @@ def test_advice_is_copied_serializable_context_and_reaches_data_requirements(evi
     assert model.calls[0]["stage"] == "before_acquisition"
 
 
+@pytest.mark.parametrize("mistake", ["malformed_uuid", "missing_evidence", "unknown_uuid"])
+def test_target_reference_mistake_gets_one_correction_with_exact_ids(evidence, mistake):
+    state, architecture = evidence
+    before = state.model_dump_json()
+    attempts = []
+    def change(payload, result):
+        attempts.append(payload)
+        if len(attempts) == 1:
+            result["evidence_ids"] = ([] if mistake == "missing_evidence" else
+                                      [str(uuid4())] if mistake == "unknown_uuid" else
+                                      [payload["proposal_ids"][0] + "-extra"])
+        return result
+    model = FakeAnalyst(change)
+    result = analyst(state, model, stage="before_acquisition", architecture_path=architecture)
+    assert len(attempts) == 2
+    contract = attempts[1]["response_contract"]
+    assert contract["proposal_ids"] == [str(state.proposals[0].id)]
+    assert contract["required_evidence_ids_if_advised"] == contract["proposal_ids"]
+    assert attempts[1]["response_validation_feedback"]["error"]
+    assert result.outcome.evidence_ids == [state.proposals[0].id]
+    assert len(result.state.analyst_reviews) == len(result.state.conversation) == 1
+    assert "one validation retry" in result.state.conversation[-1].message
+    assert state.model_dump_json() == before
+
+
+def test_repeated_malformed_uuid_stops_after_two_attempts_without_records(evidence):
+    state, architecture = evidence
+    before = state.model_dump_json()
+    model = FakeAnalyst(lambda payload, result: {**result, "evidence_ids": ["not-a-uuid"]})
+    with pytest.raises(ValueError, match="after 2 attempts"):
+        analyst(state, model, stage="before_acquisition", architecture_path=architecture)
+    assert len(model.calls) == 2
+    assert state.model_dump_json() == before and not state.analyst_reviews
+
+
 @pytest.mark.parametrize("origin", ["physical", "simulated", "test_only", "unknown"])
 def test_result_provenance_is_derived_not_invented(evidence, origin):
     state, architecture = evidence
@@ -82,7 +117,7 @@ def test_invalid_or_ineligible_evidence_is_not_success(evidence, problem):
     if problem == "failed_analysis":
         state.analyses[0] = NumericalAnalysisResult.model_validate({**state.analyses[0].model_dump(), "status": "failed", "errors": ["fixture failed"]})
     elif problem == "partial_acquisition":
-        from state import AcquisitionResult
+        from workflow.state import AcquisitionResult
         state.acquisitions[0] = AcquisitionResult.model_validate({**state.acquisitions[0].model_dump(), "status": "partial", "errors": ["partial fixture"]})
     elif problem == "missing_upstream":
         state.analyses[0].acquisition_ids = [uuid4()]

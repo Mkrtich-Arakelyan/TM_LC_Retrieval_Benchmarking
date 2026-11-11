@@ -5,12 +5,27 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from bench.config import BenchConfig
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DOTENV_PATH = REPOSITORY_ROOT / ".env"
+DEFAULT_ARCHITECTURE_PATH = REPOSITORY_ROOT / "configs" / "architecture.txt"
+
+
+def resolve_architecture_path(path: str | Path) -> Path:
+    """Redirect only this repository's former default in saved workflows."""
+    selected = Path(path)
+    if selected.resolve() == REPOSITORY_ROOT / "architecture.txt":
+        return DEFAULT_ARCHITECTURE_PATH
+    return selected
 
 
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     llm_provider: str | None = None
     llm_model: str | None = None
+    llm_router_enabled: bool = False
     api_key: SecretStr | None = Field(default=None, exclude=True)
     papers_path: Path = Path("papers")
     index_path: Path = Path("data/index")
@@ -25,7 +40,9 @@ class AppConfig(BaseModel):
     reviewed_numerics_enabled: bool = False
     numerical_input_path: Path = Path("data/raw")
     max_execution_attempts: int = Field(default=2, gt=0)
-    hardware_backend: Literal["disabled", "test", "external"] = "disabled"
+    hardware_backend: Literal["disabled", "test", "external", "simulated"] = "disabled"
+    optical_bench: BenchConfig | None = None
+    bench_test_agents: bool = False
     hardware_input_path: Path = Path("data/raw")
     max_acquisition_actions: int | None = Field(default=None, gt=0)
     max_acquisition_measurements: int | None = Field(default=None, gt=0)
@@ -35,9 +52,21 @@ class AppConfig(BaseModel):
     verified_hardware_limits: None = None
 
     @classmethod
-    def from_env(cls) -> "AppConfig":
+    def from_env(cls, dotenv_path: str | Path | None = None) -> "AppConfig":
+        """Read project .env explicitly; process environment takes precedence.
+
+        Reading values does not modify os.environ or search parent directories.
+        Pass an explicit path to isolate configuration in tests/applications.
+        """
+        path = Path(dotenv_path) if dotenv_path is not None else DEFAULT_DOTENV_PATH
+        values = {}
+        if path.is_file():
+            from dotenv import dotenv_values
+            values.update(dotenv_values(path, encoding="utf-8-sig", interpolate=False))
+        values.update(os.environ)
         names = {
             "llm_provider": "TM_LLM_PROVIDER", "llm_model": "TM_LLM_MODEL",
+            "llm_router_enabled": "TM_LLM_ROUTER_ENABLED",
             "api_key": "TM_API_KEY", "papers_path": "TM_PAPERS_PATH",
             "index_path": "TM_INDEX_PATH", "run_output_path": "TM_RUN_OUTPUT_PATH",
             "max_workflow_iterations": "TM_MAX_WORKFLOW_ITERATIONS",
@@ -57,4 +86,5 @@ class AppConfig(BaseModel):
             "hardware_action_timeout_seconds": "TM_HARDWARE_ACTION_TIMEOUT_SECONDS",
             "hardware_run_timeout_seconds": "TM_HARDWARE_RUN_TIMEOUT_SECONDS",
         }
-        return cls(**{field: os.environ[name] for field, name in names.items() if name in os.environ})
+        return cls(**{field: values[name] for field, name in names.items()
+                      if values.get(name) is not None and str(values[name]).strip()})

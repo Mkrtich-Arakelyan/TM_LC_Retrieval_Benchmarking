@@ -8,12 +8,15 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from config import AppConfig
-from state import AnalysisRequest, TMFitSettings
-from tools.numerical_fixture import create_fixture, run_fixture
+from workflow.config import AppConfig
+from workflow.state import AnalysisRequest, TMFitSettings
+from fixtures.numerical import create_fixture
+from checks.numerical import run_fixture
 from tools.python_execution import fingerprint
-from tools.tm_numerics import (aligned_matrix_errors, execute_operation,
-                               intensity_loss_gradient, load_dataset, registered_artifacts)
+from tools.tm_numerics import execute_operation
+from analysis.metrics import aligned_matrix_errors
+from analysis.tm_solvers import intensity_loss_gradient
+from analysis.datasets import load_dataset, registered_artifacts
 
 
 @pytest.fixture
@@ -184,6 +187,50 @@ def test_validation_operation_and_no_truth_mode(dataset):
     assert validation.status == "completed" and len(validation.outputs) == 1
     result = execute_operation(state, request.model_copy(update={"ground_truth_artifact_id": None}), cfg)
     assert result.status == "completed" and not any("matrix_aligned" in k for k in result.metrics)
+
+
+def test_saved_prediction_evaluation_scores_existing_outputs_without_fitting(dataset, monkeypatch):
+    import tools.tm_numerics as numerics
+    state, request, cfg = dataset
+    original = execute_operation(state, request, cfg)
+    state.analyses.append(original)
+    # The workflow's acquisition-only input root does not contain analysis outputs;
+    # evaluation must validate those separately against the recorded output root.
+    def forbidden_fit(*args, **kwargs):
+        raise AssertionError("Saved-prediction evaluation must not refit")
+    monkeypatch.setattr(numerics, "fit_methods", forbidden_fit)
+    evaluation = execute_operation(state, request.model_copy(update={
+        "operation": "tm.evaluate_saved_predictions", "input_record_ids": [original.id]}), cfg)
+    assert evaluation.status == "completed", evaluation.errors
+    report = json.loads(Path(evaluation.outputs[-1].path).read_text())
+    assert "no fitting" in report["selection"]
+    for method in ("ggs", "intensity_ls"):
+        old, new = output(original, method), output(evaluation, method)
+        np.testing.assert_array_equal(old["T"], new["T"])
+        np.testing.assert_array_equal(old["holdout_prediction"], new["holdout_prediction"])
+        assert report["methods"][method]["fit_reused"]
+        assert report["methods"][method]["source_analysis_id"] == str(original.id)
+        assert evaluation.metrics[f"{method}.holdout_rmse"] == pytest.approx(
+            np.sqrt(evaluation.metrics[f"{method}.holdout_mse"]))
+        refs = registered_artifacts(state, [original.id])[0]
+        data = load_dataset(refs[request.dataset_artifact_id], refs, cfg)
+        expected_mae = np.mean(np.abs(new["holdout_prediction"] - data.intensities[data.manifest.holdout_indices]))
+        assert evaluation.metrics[f"{method}.holdout_mae"] == pytest.approx(expected_mae)
+        assert evaluation.metrics[f"{method}.holdout_noiseless_mae"] >= 0
+    assert evaluation.metrics["intensity_ls_minus_ggs.holdout_mse"] == pytest.approx(
+        evaluation.metrics["intensity_ls.holdout_mse"] - evaluation.metrics["ggs.holdout_mse"])
+
+
+def test_saved_prediction_evaluation_rejects_modified_outputs(dataset):
+    state, request, cfg = dataset
+    original = execute_operation(state, request, cfg)
+    state.analyses.append(original)
+    reference = next(a for a in original.outputs if Path(a.path).name == "ggs.npz")
+    with Path(reference.path).open("ab") as file:
+        file.write(b"changed")
+    evaluation = execute_operation(state, request.model_copy(update={
+        "operation": "tm.evaluate_saved_predictions", "input_record_ids": [original.id]}), cfg)
+    assert evaluation.status == "failed" and "hash mismatch" in evaluation.errors[0]
 
 
 def test_real_workflow_request_returns_to_analyst_without_hardware_or_generated_code(tmp_path):

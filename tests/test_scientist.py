@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 
 from agents.scientist import DEFAULT_SYSTEM_PROMPT, ScientistOutcome, scientist
-from state import (
+from workflow.state import (
     AcquisitionResult, Artifact, ConversationEntry, ExperimentProposal,
     LiteraturePassage, NumericalAnalysisResult, Setting, WorkflowState,
 )

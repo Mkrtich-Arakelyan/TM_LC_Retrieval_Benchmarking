@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from agents.common import read_context
-from state import AnalysisCode, Artifact
+from workflow.state import AnalysisCode, Artifact
 from tools.python_execution import (BackendReport, checked_inputs, execute_python,
                                     save_script, validated_metrics)
 

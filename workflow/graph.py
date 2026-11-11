@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
 import sqlite3
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -24,11 +22,12 @@ from agents.orchestrator import (TERMINAL, ask, block, experimentor_route, expla
 from agents.runner import runner
 from agents.scientist import scientist
 from agents.analyst import analyst
-from config import AppConfig
-from state import (AcquisitionResult, ConversationEntry, HumanApproval,
+from workflow.config import AppConfig
+from workflow.state import (AcquisitionResult, ConversationEntry, HumanApproval,
                    LiteraturePassage, WorkflowState)
 from tools.hardware import DisabledHardwareBackend, HardwareBackend
 from tools.python_execution import ExecutionBackend
+from workflow.persistence import canonical_factory_path, save_analysis_progress, workflow_writer_lock
 
 
 @dataclass
@@ -39,6 +38,7 @@ class Integrations:
     execution_backend: ExecutionBackend | None = None
     cancellation_event: Event | None = None
     analyst_model: ChatModel | None = None
+    router_model: ChatModel | None = None
 
 
 class GraphState(TypedDict):
@@ -91,7 +91,11 @@ class WorkflowApp:
                  *, integration_factory: str | None = None):
         self.config = config or AppConfig()
         self.integrations = integrations or Integrations()
-        self.factory = integration_factory
+        # Explicit injected integrations/factories retain priority. Built-in clients
+        # are constructed lazily, after the fixture branch, and never checkpointed.
+        configured_llm = any((self.config.llm_provider, self.config.llm_model, self.config.api_key))
+        self.factory = canonical_factory_path(integration_factory) or (
+            "workflow.llm:build_integrations" if integrations is None and configured_llm else None)
         self._resolved = {}
         self.path = self.config.workflow_database_path.resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,6 +105,7 @@ class WorkflowApp:
         builder.add_node("ingress", lambda data: data)
         builder.add_node("dispatch", self._dispatch)
         for name, node in {"scientist": self._scientist, "analyst": self._analyst, "experimentor": self._experimentor,
+                           "router": self._router,
                            "preflight": self._preflight, "human": self._human,
                            "acquire": self._acquire, "analyze": self._analyze}.items():
             builder.add_node(name, node)
@@ -108,7 +113,7 @@ class WorkflowApp:
         builder.add_edge(START, "ingress")
         builder.add_edge("ingress", "dispatch")
         builder.add_conditional_edges("dispatch", self._destination,
-            {name: name for name in ("scientist", "analyst", "experimentor", "preflight", "human", "acquire", "analyze")} | {"end": END})
+            {name: name for name in ("router", "scientist", "analyst", "experimentor", "preflight", "human", "acquire", "analyze")} | {"end": END})
         self.graph = builder.compile(checkpointer=self.saver)
 
     def __enter__(self):
@@ -117,32 +122,8 @@ class WorkflowApp:
     def __exit__(self, *args):
         self.connection.close()
 
-    @contextmanager
     def _writer(self):
-        # Kernel locks release on process exit, unlike a persistent sentinel file.
-        with self.path.with_suffix(self.path.suffix + ".lock").open("a+b") as file:
-            file.seek(0, os.SEEK_END)
-            if not file.tell():
-                file.write(b"0")
-                file.flush()
-            file.seek(0)
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise RuntimeError("Another workflow command is active for this database; do not run concurrent acquisition commands.") from exc
-            try:
-                yield
-            finally:
-                file.seek(0)
-                if os.name == "nt":
-                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(file, fcntl.LOCK_UN)
+        return workflow_writer_lock(self.path)
 
     def _thread(self, workflow_id) -> dict:
         return {"configurable": {"thread_id": str(UUID(str(workflow_id)))},
@@ -154,20 +135,23 @@ class WorkflowApp:
     def _services(self, state: WorkflowState) -> Integrations:
         if state.control.fixture_mode:
             if state.id not in self._resolved:
-                from tools.offline_fixtures import offline_integrations
+                from fixtures.offline import offline_integrations
                 self._resolved[state.id] = Integrations(**offline_integrations(self._cfg(state), state.id,
                     include_analyst=state.control.fixture_analyst))
             return self._resolved[state.id]
         if self.factory:
-            if self.factory not in self._resolved:
+            # Factories consume saved per-workflow configuration. Share an instance
+            # within that workflow, never with a different workflow's backend.
+            key = (state.id, self.factory)
+            if key not in self._resolved:
                 module, name = self.factory.split(":", 1)
                 runtime_config = self._cfg(state)
                 runtime_config.api_key = self.config.api_key  # memory only, never checkpoint secrets
                 value = getattr(importlib.import_module(module), name)(runtime_config)
                 if not isinstance(value, Integrations):
-                    raise TypeError("Integration factory must return graph.Integrations")
-                self._resolved[self.factory] = value
-            return self._resolved[self.factory]
+                    raise TypeError("Integration factory must return workflow.graph.Integrations")
+                self._resolved[key] = value
+            return self._resolved[key]
         return self.integrations
 
     def show(self, workflow_id) -> dict:
@@ -202,6 +186,7 @@ class WorkflowApp:
                 setattr(cfg, field, getattr(cfg, field).resolve())
             cfg.run_output_path = (cfg.run_output_path / str(state.id)).resolve()
             if fixture:
+                cfg.llm_router_enabled = False
                 cfg.hardware_backend = "test"
                 cfg.numerical_backend = "test"
                 cfg.hardware_input_path = cfg.run_output_path / "fixture-input"
@@ -211,6 +196,8 @@ class WorkflowApp:
             state.control.fixture_analyst = fixture_analyst
             state.control.architecture_path = str(Path(architecture_path).resolve())
             state.control.literature_context = literature_context or []
+            if cfg.llm_router_enabled:
+                self._queue_router(state, "start", {"kind": "research_request"})
             explain(state, "TEST ONLY offline fixture workflow; no physical measurements or scientific reasoning are validated." if fixture else "Start workflow with explicit integrations; no fake responses are substituted.")
             return self._drive(state.id, _update(state))
 
@@ -270,13 +257,67 @@ class WorkflowApp:
             state.control.pending = None
             state.control.reason = None
             state.status = "pending"
-            route(state, "scientist", "interpretation", "User follow-up: use existing saved data where appropriate; do not automatically acquire again.")
+            if self._router_enabled(state):
+                self._queue_router(state, "user", {"kind": "follow_up", "message": request})
+            else:
+                route(state, "scientist", "interpretation", "User follow-up: use existing saved data where appropriate; do not automatically acquire again.")
             self.graph.update_state(self._thread(workflow_id), _update(state), as_node="ingress")
             return self._drive(workflow_id)
 
     def _destination(self, data):
         state = _state(data)
         return "end" if state.status in TERMINAL | {"blocked"} else state.control.next_node
+
+    def _router_enabled(self, state):
+        return self._cfg(state).llm_router_enabled and not state.control.fixture_mode
+
+    def _queue_router(self, state, source, outcome):
+        state.control.router_event = {"source": source, "outcome": outcome}
+        route(state, "router", state.control.task, f"{source} outcome saved → scientific routing LLM")
+
+    def _router(self, data):
+        state = _state(data)
+        try:
+            if not self._router_enabled(state):
+                raise ValueError("LLM routing is disabled for this run")
+            from agents.orchestrator import choose_route
+            decision, action = choose_route(state, self._cfg(state), self._services(state))
+            if action is None or decision.status != "accepted":
+                block(state, "Routing LLM decision rejected: " + (decision.error or decision.reason) + ". Saved records are preserved; correct the response/integration and resume.")
+                return _update(state)
+            if action.kind in ("prepare_procedure", "revise_procedure", "preflight"):
+                state.control.active_proposal_ids = [action.proposal_id, *[
+                    key for key in state.control.active_proposal_ids if key != action.proposal_id]]
+                state.control.active_approval_id = None
+                state.control.active_procedure_id = action.procedure_id
+            if action.kind == "propose":
+                route(state, "scientist", "proposal", decision.reason)
+            elif action.kind == "advise":
+                state.control.analyst_stage = "before_acquisition"
+                route(state, "analyst", "procedure", decision.reason)
+            elif action.kind in ("prepare_procedure", "revise_procedure"):
+                route(state, "experimentor", "procedure" if action.kind == "prepare_procedure" else "technical_review", decision.reason)
+            elif action.kind == "preflight":
+                route(state, "preflight", "procedure", decision.reason)
+            elif action.kind == "run_operation":
+                from workflow.state import AnalysisRequest
+                state.control.numerical_request = AnalysisRequest.model_validate(action.request.model_dump())
+                route(state, "analyze", "analysis", decision.reason)
+            elif action.kind == "review_results":
+                state.control.analyst_stage = "after_analysis"
+                state.control.router_analysis_ids = action.analysis_ids
+                route(state, "analyst", "interpretation", decision.reason)
+            elif action.kind == "interpret":
+                route(state, "scientist", "interpretation", decision.reason)
+            elif action.kind == "request_information":
+                ask(state, [decision.reason], "router")
+            elif action.kind == "conclude":
+                stop(state, "Scientist conclusion accepted by routing LLM: " + decision.reason, "completed")
+            else:
+                raise ValueError("No Python dispatcher exists for the selected router action")
+        except Exception as exc:
+            block(state, f"Routing LLM failed: {exc}. No selected action was executed; correct integration and resume.")
+        return _update(state)
 
     def _dispatch(self, data):
         state = _state(data)
@@ -308,7 +349,7 @@ class WorkflowApp:
             c.acquisition_attempt_id = uuid4()
         if revising:
             c.procedure_revisions += 1
-        state.status = {"scientist": "interpreting" if c.task == "interpretation" else "proposing",
+        state.status = {"router": "planning", "scientist": "interpreting" if c.task == "interpretation" else "proposing",
                         "analyst": "planning" if c.analyst_stage == "before_acquisition" else "interpreting",
                         "experimentor": "planning", "preflight": "planning",
                         "acquire": "acquiring", "analyze": "analyzing"}[c.next_node]
@@ -320,11 +361,16 @@ class WorkflowApp:
         try:
             services = self._services(state)
             if services.scientist_model is None:
-                block(state, "Scientist model is unconfigured. Inject graph.Integrations(scientist_model=...) or explicitly select offline fixture mode.")
+                block(state, "Scientist model is unconfigured. Inject workflow.graph.Integrations(scientist_model=...) or explicitly select offline fixture mode.")
                 return _update(state)
             result = scientist(state, services.scientist_model, state.control.literature_context,
                                architecture_path=state.control.architecture_path)
             state = result.state
+            if self._router_enabled(state):
+                if result.outcome.kind == "proposal":
+                    state.control.active_proposal_ids = [p.id for p in result.outcome.proposals]
+                self._queue_router(state, "scientist", result.outcome.model_dump(mode="json"))
+                return _update(state)
             if result.outcome.kind == "interpretation" and result.outcome.follow_up == "conclude" and len(state.control.active_proposal_ids) > 1:
                 state.control.active_proposal_ids.pop(0)
                 route(state, "experimentor", "procedure", "Continue with the next Scientist proposal; each requires a separate procedure and review.")
@@ -353,11 +399,21 @@ class WorkflowApp:
             model = self._services(state).analyst_model
             if model is None:
                 explain(state, f"Analyst {stage} skipped: model unavailable; no review recorded.")
-                route(state, target, task, "Continue through optional Analyst handoff without a successful review.")
+                if self._router_enabled(state):
+                    self._queue_router(state, "analyst", {"kind": "unavailable", "explanation": "No Analyst model is configured"})
+                else:
+                    route(state, target, task, "Continue through optional Analyst handoff without a successful review.")
                 return _update(state)
-            result = analyst(state, model, stage=stage, literature_context=state.control.literature_context,
+            analysis_ids = None
+            if self._router_enabled(state) and stage == "after_analysis":
+                analysis_ids = state.control.router_analysis_ids
+            result = analyst(state, model, stage=stage, analysis_ids=analysis_ids,
+                             literature_context=state.control.literature_context,
                              architecture_path=state.control.architecture_path)
             state = result.state
+            if self._router_enabled(state):
+                self._queue_router(state, "analyst", result.outcome.model_dump(mode="json"))
+                return _update(state)
             if result.outcome.status == "needs_information":
                 ask(state, result.outcome.questions, "analyst")
             elif result.outcome.status == "more_analysis":
@@ -376,6 +432,9 @@ class WorkflowApp:
     def _experimentor(self, data):
         state = _state(data)
         try:
+            if self._router_enabled(state) and state.control.task == "analysis":
+                self._queue_router(state, "experimentor", {"kind": "analysis_requested", "explanation": "Select a reviewed saved-data operation; generated-code execution is not a router action"})
+                return _update(state)
             services = self._services(state)
             if services.experimentor_model is None:
                 block(state, "Experimentor model is unconfigured; inject an externally configured chat model, then resume.")
@@ -392,6 +451,14 @@ class WorkflowApp:
                 config=self._cfg(state), architecture_path=state.control.architecture_path,
                 allow_partial_data=state.control.allow_partial_analysis)
             state = result.state
+            if self._router_enabled(state):
+                if result.outcome.kind == "procedure":
+                    if state.control.task == "technical_review" and result.outcome.procedure.version > 1:
+                        state.control.procedure_revisions += 1
+                    state.control.active_procedure_id = result.outcome.procedure.id
+                    state.control.active_approval_id = None
+                self._queue_router(state, "experimentor", result.outcome.model_dump(mode="json"))
+                return _update(state)
             if result.outcome.kind == "procedure" and state.control.task == "technical_review" and result.outcome.procedure.version > 1:
                 state.control.procedure_revisions += 1
             experimentor_route(state, result.outcome)
@@ -464,17 +531,26 @@ class WorkflowApp:
             state.approvals.append(approval)
             state.control.active_approval_id = approval.id if action == "approve" else None
             state.conversation.append(ConversationEntry(role="human", message=f"{action}: {response.get('feedback') or 'exact displayed review'}", record_ids=[approval.id]))
-            route(state, "acquire" if action == "approve" else "experimentor", "procedure",
-                  "Human approved exact review; Runner must revalidate before acquisition." if action == "approve" else "Human rejected procedure with feedback; Experimentor must revise and obtain new approval.")
+            if action == "reject" and self._router_enabled(state):
+                self._queue_router(state, "human", {"kind": "procedure_rejected", "explanation": response.get("feedback") or "Procedure rejected"})
+            else:
+                route(state, "acquire" if action == "approve" else "experimentor", "procedure",
+                      "Human approved exact review; Runner must revalidate before acquisition." if action == "approve" else "Human rejected procedure with feedback; Experimentor must revise and obtain new approval.")
         elif action == "reconcile":
             state.conversation.append(ConversationEntry(role="human", message="Operator reconciliation (not a successful-acquisition claim): " + response["message"]))
             state.control.acquisition_attempt_id = None
             state.control.active_approval_id = None
-            route(state, "experimentor", "technical_review", "Operator reports equipment stopped; retain uncertain records and request technical review. Never replay the interrupted attempt.")
+            if self._router_enabled(state):
+                self._queue_router(state, "human", {"kind": "acquisition_reconciled", "explanation": "Operator reports stopped; incomplete evidence requires technical review or a new reviewed procedure, never replay"})
+            else:
+                route(state, "experimentor", "technical_review", "Operator reports equipment stopped; retain uncertain records and request technical review. Never replay the interrupted attempt.")
         else:
             state.conversation.append(ConversationEntry(role="user", message=response["message"]))
             state.control.allow_partial_analysis = response.get("allow_partial_analysis", state.control.allow_partial_analysis)
-            route(state, state.control.return_node, state.control.task, "Human clarification received; resume the requesting task without changing verified limits or approvals.")
+            if self._router_enabled(state):
+                self._queue_router(state, "human", {"kind": "clarification", "message": response["message"]})
+            else:
+                route(state, state.control.return_node, state.control.task, "Human clarification received; resume the requesting task without changing verified limits or approvals.")
         state.control.pending = None
         if state.status not in TERMINAL:
             state.status = "pending"
@@ -506,7 +582,7 @@ class WorkflowApp:
                 if record is not None and record.status == "completed":
                     state.control.configuration["numerical_input_path"] = str(cfg.run_output_path / "acquisitions")
                     explain(state, "Recovered completed Runner journal after interruption; hardware was not called again.")
-                    route(state, "analyze", "analysis", "Recovered saved acquisition → Experimentor analysis.")
+                    self._saved_acquisition_analysis(state, record)
                     return _update(state)
                 ask(state, ["Acquisition outcome is uncertain. Inspect the durable journal and raw files, confirm equipment stopped, then reconcile for technical review or cancel. No automatic retry."], "experimentor", kind="reconciliation")
                 return _update(state)
@@ -526,15 +602,26 @@ class WorkflowApp:
                     self._preflight_issues(state, result)
             elif result.acquisition.status == "completed":
                 state.control.configuration["numerical_input_path"] = str(cfg.run_output_path / "acquisitions")
-                route(state, "analyze", "analysis", "Completed acquisition → Experimentor numerical analysis of saved data.")
+                self._saved_acquisition_analysis(state, result.acquisition)
             else:
-                route(state, "experimentor", "technical_review", "Acquisition failed/partial/aborted. Review completed and uncertain actions; never automatically rerun hardware or analyze partial data without an explicit request.")
+                if self._router_enabled(state):
+                    self._queue_router(state, "runner", {"kind": "acquisition_failed", "record_id": str(result.acquisition.id),
+                        "status": result.acquisition.status, "explanation": "; ".join(result.acquisition.errors)})
+                else:
+                    route(state, "experimentor", "technical_review", "Acquisition failed/partial/aborted. Review completed and uncertain actions; never automatically rerun hardware or analyze partial data without an explicit request.")
         except Exception as exc:
             if directory.exists():
                 ask(state, [f"Acquisition interrupted or recording failed: {exc}. Reconcile hardware and journal before further work."], "experimentor", kind="reconciliation")
             else:
                 block(state, f"Acquisition could not start: {exc}")
         return _update(state)
+
+    def _saved_acquisition_analysis(self, state, acquisition):
+        if self._router_enabled(state):
+            self._queue_router(state, "runner", {"kind": "acquisition_completed", "record_id": str(acquisition.id),
+                "data_origin": acquisition.data_origin, "status": acquisition.status})
+            return
+        route(state, "analyze", "analysis", "Completed acquisition → Experimentor numerical analysis of saved data.")
 
     def _analyze(self, data):
         state = _state(data)
@@ -556,6 +643,9 @@ class WorkflowApp:
                 return _update(state)
             if state.control.numerical_request is not None:
                 return self._reviewed_analysis(state, cfg, operation)
+            if self._router_enabled(state):
+                self._queue_router(state, "workflow", {"kind": "analysis_requested"})
+                return _update(state)
             services = self._services(state)
             if services.experimentor_model is None:
                 block(state, "Experimentor model is unconfigured; inject it before numerical analysis.")
@@ -591,8 +681,15 @@ class WorkflowApp:
         explain(state, "Reviewed numerical operation: " + numerical.model_dump_json())
         if numerical.status == "completed":
             state.control.numerical_request = None
-            route(state, "scientist", "interpretation", "Reviewed numerical results → Analyst review → Scientist interpretation.")
-            self._analyst_handoff(state, "after_analysis")
+            if self._router_enabled(state):
+                self._queue_router(state, "numerical_tool", {"kind": "analysis_completed", "record_id": str(numerical.id),
+                    "operation": numerical.method_settings.get("operation"), "status": numerical.status})
+            elif state.control.pending_numerical_requests:
+                state.control.numerical_request = state.control.pending_numerical_requests.pop(0)
+                route(state, "analyze", "analysis", "Saved first condition; compare the paired condition with the same reviewed settings before interpretation.")
+            else:
+                route(state, "scientist", "interpretation", "Reviewed numerical results → Analyst review → Scientist interpretation.")
+                self._analyst_handoff(state, "after_analysis")
         else:
             block(state, "Reviewed numerical operation " + numerical.status + ": "
                   + "; ".join(numerical.errors or [numerical.execution.reason or "Unavailable"]))
@@ -601,9 +698,4 @@ class WorkflowApp:
 
     @staticmethod
     def _save_analysis_progress(operation: Path, state: WorkflowState):
-        path = operation / "progress.tmp"
-        with path.open("w", encoding="utf-8") as file:
-            file.write(state.model_dump_json())
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(path, operation / "progress.json")
+        save_analysis_progress(operation, state)

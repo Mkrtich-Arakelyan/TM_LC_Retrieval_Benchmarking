@@ -1,8 +1,8 @@
 import pytest
 from pydantic import ValidationError
 
-from config import AppConfig
-from state import (
+from workflow.config import AppConfig
+from workflow.state import (
     AcquisitionAction, AcquisitionResult, Artifact, ConversationEntry,
     ExperimentProcedure, ExperimentProposal, HumanApproval, NumericalAnalysisResult,
     ScientificFinding, Setting, WorkflowState, approval_matches,
@@ -126,19 +126,19 @@ def test_approval_covers_exact_content_and_version():
         assert not approval_matches(approval.model_copy(update={"status": status}), procedure)
 
 
-def test_config_is_optional_secret_redacted_and_limits_unknown(monkeypatch):
+def test_config_is_optional_secret_redacted_and_limits_unknown(monkeypatch, tmp_path):
     for name in list(__import__("os").environ):
         if name.startswith("TM_"):
             monkeypatch.delenv(name)
-    config = AppConfig.from_env()
+    config = AppConfig.from_env(tmp_path / ".env")
     assert config.llm_model is None and config.api_key is None
     assert config.verified_hardware_limits is None
     monkeypatch.setenv("TM_API_KEY", "fixture-secret")
     monkeypatch.setenv("TM_NUMERICAL_TIMEOUT_SECONDS", "120")
-    config = AppConfig.from_env()
+    config = AppConfig.from_env(tmp_path / ".env")
     assert config.numerical_timeout_seconds == 120
     assert "fixture-secret" not in config.model_dump_json()
     assert "fixture-secret" not in repr(config)
     monkeypatch.setenv("TM_MAX_WORKFLOW_ITERATIONS", "0")
     with pytest.raises(ValidationError):
-        AppConfig.from_env()
+        AppConfig.from_env(tmp_path / ".env")

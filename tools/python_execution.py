@@ -17,8 +17,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from config import AppConfig
-from state import AnalysisCode, Artifact, ExecutionDetails, NumericalAnalysisResult
+from workflow.config import AppConfig
+from workflow.state import AnalysisCode, Artifact, ExecutionDetails, NumericalAnalysisResult
 
 
 class BackendReport(BaseModel):
