@@ -1,6 +1,7 @@
 """LLM scientific routing with Python-owned action policy; legacy fixture routing."""
 
 import json
+from agents.common import handoff_context
 
 from pydantic import BaseModel
 
@@ -17,6 +18,13 @@ dataset inventory entries marked validated have already passed Python's checks;
 prefer the comparison operation over redundant validation-only work.
 For synthetic-bench-v1 data, bench.retrieve is the reviewed saved-data operation;
 after its results, obtain Analyst review and Scientist interpretation before concluding.
+Use the Analyst's structured recovery assessment: accurate predictions do not prove
+mapping or complex recovery. Prefer an offered plan_follow_up for a discriminating
+measurement when recovery is required. It requests Experimentor planning, never
+acquisition. If the required control is missing, obtain Scientist interpretation
+and conclude with recovery unresolved; do not ask the user to certify a capability
+or repeat nondiscriminating measurements. Prediction-only tasks may conclude at
+prediction, with remaining recovery limitations recorded.
 obtain results for the relevant conditions before interpretation. Do not repeat an
 operation already completed unless the offered action explicitly requests new work.
 If no compatible data exist but acquisition is available, have Scientist establish
@@ -42,8 +50,9 @@ def routing_context(state, config, services):
     event = state.control.router_event
     raw = event.get("outcome", {})
     latest = {key: raw[key] for key in ("kind", "status", "explanation", "recommended_next_step", "questions",
-              "scientific_decisions", "follow_up", "record_id", "operation", "message") if key in raw}
+              "scientific_decisions", "follow_up", "recovery", "record_id", "operation", "message") if key in raw}
     context = {"research_question": state.user_request,
+        "handoffs": handoff_context(state, "orchestrator"),
         "literature_source_ids": [p.source_id for p in state.control.literature_context],
         "latest_agent_outcome": {"source": event.get("source"), **latest},
         "clarifications": [c.message[:1600] for c in state.conversation if c.role in ("user", "human")][-4:],
@@ -92,21 +101,21 @@ def choose_route(state, config, services):
             reason=choice.reason if choice else "Routing response could not be accepted",
             error=str(exc)[:3000] or type(exc).__name__, context=context)
     state.router_decisions.append(decision)
-    state.conversation.append(ConversationEntry(role="orchestrator", record_ids=[decision.id, *decision.record_ids],
+    state.conversation.append(ConversationEntry(role="orchestrator", kind="trace", record_ids=[decision.id, *decision.record_ids],
         message="Routing LLM decision: " + decision.model_dump_json(exclude={"context"})))
     return decision, action
 
 TERMINAL = {"completed", "cancelled", "stopped", "failed"}
 
 
-def explain(state: WorkflowState, message: str) -> None:
-    state.conversation.append(ConversationEntry(role="orchestrator", message=message))
+def explain(state: WorkflowState, message: str, *, kind="decision") -> None:
+    state.conversation.append(ConversationEntry(role="orchestrator", kind=kind, message=message))
 
 
-def route(state: WorkflowState, node: str, task: str, reason: str) -> None:
+def route(state: WorkflowState, node: str, task: str, reason: str, *, kind="decision") -> None:
     state.control.next_node = node
     state.control.task = task
-    explain(state, reason)
+    explain(state, reason, kind=kind)
 
 
 def block(state: WorkflowState, reason: str) -> None:

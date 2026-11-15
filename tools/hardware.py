@@ -154,6 +154,13 @@ def hardware_configuration(config: AppConfig) -> dict:
     return settings
 
 
+def prerequisite_id_errors(procedure: ExperimentProcedure, caps: HardwareCapabilities) -> list[str]:
+    """Validate selectors, never interpret agent prose as verification evidence."""
+    choices = sorted(caps.prerequisites)
+    return [f"procedure.prerequisites[{index}]: unsupported prerequisite ID {name!r}; allowed choices: {choices}"
+            for index, name in enumerate(procedure.prerequisites) if name not in caps.prerequisites]
+
+
 def preflight(procedure: ExperimentProcedure, config: AppConfig,
               backend: HardwareBackend | None = None) -> AcquisitionReview:
     """Read-only checks; architecture text is deliberately not a source of limits."""
@@ -181,6 +188,8 @@ def preflight(procedure: ExperimentProcedure, config: AppConfig,
         issues.append("Simulated configuration requires an explicitly simulated backend; physical fallback is forbidden")
     if not caps.supports_deadlines or not caps.supports_cancellation:
         issues.append("Backend has not verified bounded execution and cancellation support")
+    if cfg.hardware_backend == "simulated":
+        issues.extend("Procedure validation error: " + error for error in prerequisite_id_errors(proc, caps))
     if cfg.max_acquisition_actions is not None and len(proc.actions) > cfg.max_acquisition_actions:
         issues.append("Configured acquisition action budget exceeded")
     required = set(proc.prerequisites)

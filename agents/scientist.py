@@ -6,19 +6,26 @@ import json
 from pathlib import Path
 from typing import Literal, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 
 from workflow.state import (
-    ConversationEntry, ExperimentProposal, LiteraturePassage,
+    AgentHandoff, ConversationEntry, ExperimentProposal, LiteraturePassage,
     ScientificFinding, Text, WorkflowState,
 )
 from agents.common import ChatModel, DEFAULT_ARCHITECTURE_PATH, NO_LITERATURE_NOTICE, read_context
+from workflow.config import AppConfig
+from agents.common import HANDOFF_INSTRUCTIONS, handoff_context, save_handoff, validate_handoff
 
 DEFAULT_SYSTEM_PROMPT = """You are the Scientist for LC-SLM transmission-matrix retrieval benchmarking.
 When llm_router_enabled is true, next-step and follow_up fields are recommendations;
 the separate routing LLM selects the next permitted action. Do the assigned scientific task.
 Consult state.analyst_reviews for technical limitations; Analyst review is not a
 scientific conclusion and never makes failed/partial evidence eligible.
+Preserve the Analyst's recovery assessment in your interpretation. Distinguish
+brightness prediction from input mapping and complex recovery up to method
+ambiguities. If required discriminating controls are unavailable, conclude with
+recovery unresolved and the missing capability, without implying low prediction
+error proves recovery. A prediction-only task may conclude on that narrower basis.
 Choose proposal, interpretation, or request_information from the research request
 and workflow state. Do not prescribe a fixed experiment count or algorithm.
 Use architecture_text as the source of setup-specific facts and modeling boundaries.
@@ -45,7 +52,12 @@ Discuss failed or incomplete work as limitations or request information; never
 turn it into successful findings. Artifact paths are metadata, not inspected data.
 
 Only cite supplied literature_context source_id values, using cited_source_ids
-and proposal literature_references. Put all literature citations in those fields,
+and proposal literature_references. Select exact strings from allowed_source_ids;
+never append a colon, quotation, or explanation to an ID. Keep citation explanations
+in explanation or proposal rationale. Both citation fields are validated, including
+every proposal. If scientist_validation feedback is supplied, correct the offending
+fields using its errors and allowed IDs. Unknown citations remain invalid; do not
+guess or ask the user to resolve output formatting. Put all literature citations in those fields,
 not free-text bibliographies. Never invent citations or claim to have searched
 or read project papers. Without supplied literature, explicitly say recommendations
 have not been checked against the project's papers; general domain knowledge is
@@ -61,7 +73,7 @@ defaults to concluding; set follow_up=analysis only when more saved-data analysi
 needed. Additional measurements require a new proposal and human approval cycle.
 Follow the current task and human clarifications in workflow state, preserving the
 original research request. Never use clarification requests to bypass hardware review.
-"""
+""" + HANDOFF_INSTRUCTIONS
 
 
 
@@ -75,6 +87,7 @@ class ScientistOutcome(BaseModel):
     questions: list[Text] = Field(default_factory=list)
     cited_source_ids: list[Text] = Field(default_factory=list)
     follow_up: Literal["conclude", "analysis"] = "conclude"
+    handoff: AgentHandoff | None = None
 
     @model_validator(mode="after")
     def coherent_kind(self) -> ScientistOutcome:
@@ -95,14 +108,83 @@ class ScientistResult(BaseModel):
     state: WorkflowState
 
 
+class ScientistOutputValidationError(ValueError):
+    def __init__(self, errors, state):
+        super().__init__("Scientist output validation error: " + json.dumps(errors, ensure_ascii=False, default=str)
+                         + "; output repair budget exhausted")
+        self.state = state
+
+
+def _citation_schema(source_ids):
+    """Constrain the model-facing schema without changing persisted record types."""
+    citation_field = Field(default_factory=list, description="Exact supplied source IDs only; explanations belong in prose",
+                           **({} if source_ids else {"max_length": 0}))
+    item = Literal[tuple(source_ids)] if source_ids else Text
+    proposal = create_model("CitedExperimentProposal", __base__=ExperimentProposal,
+                            literature_references=(list[item], citation_field))
+    return create_model("CitedScientistOutcome", __base__=ScientistOutcome,
+                        cited_source_ids=(list[item], citation_field),
+                        proposals=(list[proposal], Field(default_factory=list)))
+
+
+def _validated_response(model, payload, snapshot, config):
+    """Use the planning repair pattern: exact feedback, bounded calls, no invalid records."""
+    allowed = payload["allowed_source_ids"]
+    schema = _citation_schema(allowed)
+    # One repair, bounded also by the existing workflow model-call limit.
+    attempts = min(2, config.max_workflow_iterations)
+    audit = []
+    citation_repair = False
+    for attempt in range(attempts):
+        previous = None
+        try:
+            raw = model.with_structured_output(schema).invoke([
+                ("system", DEFAULT_SYSTEM_PROMPT), ("human", json.dumps(payload, ensure_ascii=False, default=str))])
+            previous = raw.model_dump(mode="json") if isinstance(raw, BaseModel) else raw
+            # Validate locally too: injected models need not enforce their schema.
+            # Literal IDs are checked before the shared Text type strips whitespace.
+            checked = schema.model_validate(previous)
+            outcome = ScientistOutcome.model_validate(checked.model_dump(mode="json"))
+            validate_handoff(outcome.handoff, payload)
+            errors = []
+            if citation_repair and outcome.kind == "request_information":
+                errors.append({"field": "kind", "invalid_value": outcome.kind,
+                               "error": "Citation repair must correct the output, not request user clarification for formatting",
+                               "allowed_source_ids": allowed})
+        except ValidationError as exc:
+            errors = [{"field": ".".join(map(str, error["loc"])) or "model_response",
+                       "invalid_value": error["input"],
+                       "error": ("Unknown literature source identifiers: " if any(
+                           part in ("cited_source_ids", "literature_references") for part in error["loc"])
+                           else "Invalid Scientist model response: ") + error["msg"],
+                       "allowed_source_ids": allowed} for error in exc.errors(include_url=False)]
+        except (TypeError, ValueError) as exc:
+            errors = [{"field": "model_response", "error": f"Invalid Scientist model response: {exc}",
+                       "allowed_source_ids": allowed}]
+        if not errors:
+            return outcome, audit
+        citation_repair = citation_repair or any(
+            "cited_source_ids" in error["field"] or "literature_references" in error["field"] for error in errors)
+        feedback = {"errors": errors, "allowed_source_ids": allowed,
+                    "previous_response": previous,
+                    "instruction": "Correct invalid fields. Use exact IDs only; keep explanations in prose. Do not request user clarification for citation formatting."}
+        audit.append("Rejected Scientist output (not committed): " + json.dumps(feedback, ensure_ascii=False, default=str))
+        if attempt + 1 == attempts:
+            snapshot.conversation.append(ConversationEntry(role="scientist", message="\n\n".join(audit)))
+            raise ScientistOutputValidationError(errors, snapshot)
+        payload["scientist_validation"] = feedback
+        payload["remaining_output_repairs"] = attempts - attempt - 2
+
+
 def scientist(
     state: WorkflowState,
     model: ChatModel,
     literature_context: Sequence[LiteraturePassage] | None = None,
     *,
     architecture_path: str | Path = DEFAULT_ARCHITECTURE_PATH,
+    config: AppConfig | None = None,
 ) -> ScientistResult:
-    """Read context afresh, invoke once, validate, and return a copied state.
+    """Read context afresh, validate with one bounded repair, return a copied state.
 
     The injected model must support LangChain's with_structured_output/invoke
     interface. No provider client or framework runtime is created here.
@@ -114,23 +196,12 @@ def scientist(
         "workflow_state": snapshot.model_dump(mode="json"),
         **context.model_dump(mode="json"),
         "literature_status": "Supplied passages only; no search performed." if passages else NO_LITERATURE_NOTICE,
+        "allowed_source_ids": sorted({p.source_id for p in passages}),
+        "handoffs": handoff_context(snapshot, "scientist"),
+        "handoff_required": bool(snapshot.control.configuration),
     }
-    messages = [("system", DEFAULT_SYSTEM_PROMPT),
-                ("human", json.dumps(payload, ensure_ascii=False))]
-    try:
-        raw = model.with_structured_output(ScientistOutcome).invoke(messages)
-        if isinstance(raw, BaseModel):
-            raw = raw.model_dump()
-        outcome = ScientistOutcome.model_validate(raw)
-    except (ValidationError, TypeError) as exc:
-        raise ValueError(f"Invalid Scientist model response: {exc}") from exc
-
-    supplied = {p.source_id for p in passages}
-    cited = set(outcome.cited_source_ids)
-    for proposal in outcome.proposals:
-        cited.update(proposal.literature_references)
-    if invented := cited - supplied:
-        raise ValueError(f"Unknown literature source identifiers: {sorted(invented)}")
+    cfg = config or AppConfig.model_validate(snapshot.control.configuration)
+    outcome, repair_audit = _validated_response(model, payload, snapshot, cfg)
 
     acquisitions = {record.id: record for record in snapshot.acquisitions}
     completed_acquisitions = {key for key, record in acquisitions.items() if record.status == "completed"}
@@ -157,10 +228,13 @@ def scientist(
     snapshot.proposals.extend(proposal.model_copy(deep=True) for proposal in outcome.proposals)
     snapshot.findings.extend(finding.model_copy(deep=True) for finding in outcome.findings)
     message = f"{outcome.explanation}\n\nNext step: {outcome.recommended_next_step}"
+    if repair_audit:
+        message = "\n\n".join([*repair_audit, message])
     if outcome.questions:
         message += "\n\nQuestions:\n" + "\n".join(outcome.questions)
     snapshot.conversation.append(ConversationEntry(
-        role="scientist", message=message, record_ids=new_ids, scientific_context=context,
+        role="scientist", kind="trace", message=message, record_ids=new_ids, scientific_context=context,
     ))
+    save_handoff(snapshot, "scientist", outcome.handoff, new_ids)
     # Routing remains the future Orchestrator's job; workflow status is unchanged.
     return ScientistResult(outcome=outcome, state=snapshot)

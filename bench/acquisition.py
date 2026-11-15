@@ -90,17 +90,23 @@ def run_acquisition(bench, config, action, *, output_dir, deadline, cancel_event
         writer.writeheader()
         writer.writerows(attempts)
     artifacts.append(saved_artifact(csv_path, "Every calibration adjustment; whole-frame saturation fraction"))
-    from bench.plots import calibration_plot, frame_preview
-    calibration_plot(attempts, output_dir / "calibration.png")
+    from bench.plots import calibration_plot, frame_preview, raw_frame_image
+    accepted_attempt = attempts[-1]["attempt"] if error is None and attempts else None
+    calibration_plot(attempts, output_dir / "calibration.png", accepted_attempt=accepted_attempt)
     artifacts.append(saved_artifact(output_dir / "calibration.png", "Calibration with shaded 3–5% target band"))
-    diagnostics = {"target": [.03, .05], "success": error is None, "error": error, "attempts": attempts}
+    diagnostics = {**bench.metadata, "target": [.03, .05], "success": error is None, "error": error,
+                   "attempts": attempts, "accepted_attempt": accepted_attempt}
     for name, frame in zip(("before", "after"), (frames[0], frames[-1])) if frames else []:
         np.save(output_dir / f"raw_{name}.npy", frame)
-        frame_preview(frame, bench.regions, output_dir / f"preview_{name}.png", name)
+        raw_frame_image(frame, output_dir / f"raw_{name}.png")
+        frame_preview(frame, bench.regions, output_dir / f"preview_{name}.png", name,
+                      crop=bench.metadata["camera_crop"])
         _, sat = extract_detectors(frame, bench.regions)
+        y0, y1, x0, x1 = bench.metadata["camera_crop"]
         diagnostics[name] = {"whole_frame_saturation": float(np.mean(frame == 255)),
-                             "detector_saturation": sat.tolist()}
-        for filename in (f"raw_{name}.npy", f"preview_{name}.png"):
+                             "detector_saturation": sat.tolist(),
+                             "crop_saturation": float((frame[y0:y1, x0:x1] == 255).mean())}
+        for filename in (f"raw_{name}.npy", f"raw_{name}.png", f"preview_{name}.png"):
             artifacts.append(saved_artifact(output_dir / filename, f"Calibration {name}; same raw 0–255 scale"))
     write_json(output_dir / "calibration.json", diagnostics)
     artifacts.append(saved_artifact(output_dir / "calibration.json", "Whole-frame/per-detector saturation and stopping reason"))
@@ -119,7 +125,7 @@ def run_acquisition(bench, config, action, *, output_dir, deadline, cancel_event
         for i, pattern in enumerate(phases):
             check()
             sequence.append(bench.frame(pattern, shutter, power, capture_index=1000 + i))
-    except TimeoutError as exc:
+    except (TimeoutError, ValueError) as exc:
         return ActionReport(raw_data=artifacts, errors=[str(exc)], aborted=True)
     raw = np.asarray(sequence)
     readings, saturation = extract_detectors(raw, bench.regions)
@@ -131,6 +137,7 @@ def run_acquisition(bench, config, action, *, output_dir, deadline, cancel_event
     arrays = saved_artifact(arrays_path, "Known phase-only patterns and uint8 camera measurements; no hidden fields/T")
     artifacts.append(arrays)
     manifest = {"kind": "synthetic-bench-v1", "arrays": arrays.model_dump(mode="json"),
+        **bench.metadata,
         "data_origin": "simulated", "regions": bench.regions,
         "fit_patterns": cfg.fit_patterns, "holdout_patterns": cfg.holdout_patterns,
         "shutter_seconds": shutter, "laser_power_mw": power,

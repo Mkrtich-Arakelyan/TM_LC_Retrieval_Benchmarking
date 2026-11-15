@@ -98,6 +98,6 @@ def runner(
     explanation += "\nNext step: " + next_step
     snapshot.acquisition_reviews.append(review.model_copy(deep=True))
     record_ids = [review.id] + ([acquisition.id] if acquisition else [])
-    snapshot.conversation.append(ConversationEntry(role="runner", message=explanation, record_ids=record_ids))
+    snapshot.conversation.append(ConversationEntry(role="runner", kind="execution_event", message=explanation, record_ids=record_ids))
     return RunnerResult(status=status, explanation=explanation, review=review, acquisition=acquisition,
                         technical_issues=issues, recommended_next_step=next_step, state=snapshot)

@@ -120,6 +120,7 @@ def test_analysis_only_follow_up_does_not_acquire_again(workflow_setup):
         state = payload["workflow_state"]
         if any(e["role"] == "user" and "more analysis" in e["message"] for e in state["conversation"]) and len(state["analyses"]) == 1:
             return {"kind": "analysis_request", "explanation": "More diagnostics on saved data only",
+                    "handoff": {"recipient": "experimentor", "message": "Experimentalist, calculate more diagnostics using only saved data.", "reply_to": None},
                     "recommended_next_step": "Experimentor analyze existing data"}
         return result
     services.scientist_model.transform = followup
@@ -158,6 +159,7 @@ def test_scientific_change_is_returned_to_scientist(workflow_setup):
         state = payload["workflow_state"]
         if schema is ExperimentorOutcome and state["control"]["task"] == "technical_review":
             return {"kind": "request_information", "explanation": "Control change needs a scientific decision",
+                    "handoff": {"recipient": "scientist", "message": "Scientist, may the scientific control change?", "reply_to": None},
                     "scientific_decisions": ["May the scientific control change?"], "recommended_next_step": "Scientist decision"}
         if result["kind"] == "procedure" and not state["procedures"]:
             result["procedure"]["actions"][0]["action"] = "unsupported"
@@ -176,6 +178,7 @@ def test_missing_information_pauses_without_model_busy_loop(workflow_setup):
     def need_info(payload, schema, result):
         if not any(e["role"] == "user" for e in payload["workflow_state"]["conversation"]):
             return {"kind": "request_information", "explanation": "Essential format missing",
+                    "handoff": {"recipient": "human", "message": "What is the saved-data format?", "reply_to": None},
                     "recommended_next_step": "Ask user", "questions": ["What is the saved-data format?"]}
         return result
     services.scientist_model.transform = need_info

@@ -5,6 +5,7 @@ import json
 from workflow.state import LiteraturePassage
 
 from bench.optical_bench import SimulatedBackend
+from bench.matrices import pin_detector_matrix
 from fixtures.offline import LocalScientist, LocalExperimentor, LocalAnalyst, LocalRouter
 
 PAPER_PASSAGES = [
@@ -66,7 +67,10 @@ pattern. One bench.acquire action runs this protocol, including calibration. Sup
 shutter_seconds in s, laser_power_mw in mW and frame_budget in frame, exactly as the
 verified capabilities allow. Default initial settings and counts are below. Budget
 includes the maximum calibration attempts plus all fit and holdout frames.
-Four 2x2 detector regions have uniform coherent response within each ROI. Extract
+The active SLM area is 8x8 pixels, tiled by sixteen 2x2 phase-only input regions.
+The full raw camera frame is 20x20. Its centered 8x8 crop is [6:14,6:14], tiled by
+sixteen 2x2 speckle grains, ordered left to right, top to bottom, matching SLM order.
+Each grain has uniform coherent response in its four pixels. Extract
 the mean uint8 count; any 255 pixel marks that detector reading clipped. A reference
 procedure uses independently sampled random phases and reference-free GGS fitting.
 bench.retrieve fits only unclipped training readings per detector; it selects restarts
@@ -78,6 +82,11 @@ No internal fields or true matrix are provided. Use the supplied model contract 
 synthetic prerequisites, never as verified laboratory facts. The Runner still needs
 exact human procedure/review approval; agents cannot grant it. Use the existing
 routing actions to obtain Analyst review and Scientist interpretation after retrieval.
+Procedure prerequisites must select exact IDs from the supplied backend capability
+map. Keep explanatory text separate. Calibration is executed by bench.acquire and
+can fail; it is not a condition to certify before acquisition. Human approval is
+owned by the workflow after preflight. bench.retrieve is a separate reviewed numerical
+operation offered after an eligible dataset exists, not an acquisition action.
 Model configuration (synthetic values only):
 """ + json.dumps(config.model_dump(), indent=2)
 
@@ -90,6 +99,16 @@ def build_integrations(config):
     services = build_model_integrations(config)
     services.hardware_backend = backend
     return services
+
+
+def prepare_simulation(config):
+    """Pin inputs before saving workflow state; export only public matrix identity."""
+    from bench.optical_bench import OpticalBench
+    from bench.acquisition import write_json
+    config.optical_bench = pin_detector_matrix(config.optical_bench)
+    metadata = OpticalBench(config.optical_bench).metadata
+    config.run_output_path.mkdir(parents=True, exist_ok=True)
+    write_json(config.run_output_path / "bench-metadata.json", metadata)
 
 
 def build_model_integrations(config):

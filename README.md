@@ -29,6 +29,20 @@ with the synthetic setup context in `bench/workflow.py`. See
 and the standalone interference check. Simulation always requires explicit
 `--simulate`; it never selects physical hardware automatically.
 
+Simulation uses sixteen 2x2 speckle blocks tiling a centered 8x8 crop of the 20x20
+raw frame, with an 8x8 active phase-only SLM, sixteen inputs and a 16x16 TM.
+It supports seeded random mixing or an exact 16x16 JSON
+matrix selected with `detector_matrix_path` in a bench config. See the
+[random, identity, and complex mixing commands](docs/optical-bench.md#random-or-supplied-detector-matrix)
+for live-agent starts, matrix format, source fingerprint checks, and phase-only
+identity-matrix ambiguity.
+
+Each bench run also writes `run-summary.md`, linking its recorded decisions,
+calibration attempts, separate raw/annotated camera images, representative
+held-out detector grids, and error/clipping counts across all held-out patterns.
+The summary is written even when calibration stops and keeps workflow completion,
+measurement quality, and prediction quality separate.
+
 Primary commands (PowerShell, from the project root):
 
 ```powershell
@@ -66,10 +80,13 @@ tools/
 bench/
   optical_bench.py         Optical model and simulated backend adapter
   acquisition.py          Calibration and frame acquisition sequence
-  config.py, plots.py      Synthetic settings and inspection plots
+  config.py, geometry.py   Synthetic settings and shared detector/SLM geometry
+  plots.py                 Inspection plots
   workflow.py             Question, paper context, setup, integration factories
 analysis/
   bench_analysis.py        Bench retrieval and held-out evaluation
+    recovery.py              Truth-free measurement diagnostics for Analyst review
+    run_inspection.py        Human-only matrix and prediction-baseline report exports
   datasets.py, metrics.py  Dataset validation/loading and numerical metrics
   tm_analysis.py           Saved-data TM operation implementation
   tm_solvers.py            Shared fitting and bounded archive loading

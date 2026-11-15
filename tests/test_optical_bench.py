@@ -79,7 +79,7 @@ def test_end_to_end_calibration_approval_and_heldout_prediction(tmp_path, shutte
     analysis = state["analyses"][-1]
     assert analysis["metrics"]["prediction_passed"] == 1, analysis["metrics"]
     assert analysis["metrics"]["measurement_passed"] == 1
-    assert analysis["metrics"]["holdout_usable_readings"] == 4 * bench.holdout_patterns
+    assert analysis["metrics"]["holdout_usable_readings"] == 16 * bench.holdout_patterns
     assert state["analyst_reviews"][-1]["status"] == "reviewed"
     assert {e["role"] for e in state["conversation"]} >= {"scientist", "experimentor", "runner", "analyst"}
     manifest_ref = next(a for a in acquisition["raw_data"] if a["path"].endswith("bench-dataset.json"))
@@ -161,10 +161,10 @@ def test_clipped_fit_exclusion_and_holdout_never_change_fit(tmp_path):
     first.mkdir()
     second.mkdir()
     metrics, _ = retrieve(manifest, data, settings, first, deadline=time.monotonic()+120)
-    assert metrics["fit_clipped_readings"] == 16
-    assert metrics["fit_usable_readings"] == 4 * (manifest["fit_patterns"]-4)
-    assert metrics["holdout_clipped_readings"] == 4
-    assert metrics["holdout_usable_readings"] == 4 * (manifest["holdout_patterns"]-1)
+    assert metrics["fit_clipped_readings"] == 64
+    assert metrics["fit_usable_readings"] == 16 * (manifest["fit_patterns"]-4)
+    assert metrics["holdout_clipped_readings"] == 16
+    assert metrics["holdout_usable_readings"] == 16 * (manifest["holdout_patterns"]-1)
     # Alter held-out outcomes drastically; recovered matrix must stay identical.
     data["detector_readings"][manifest["fit_patterns"]:] = 0
     retrieve(manifest, data, settings, second, deadline=time.monotonic()+120)

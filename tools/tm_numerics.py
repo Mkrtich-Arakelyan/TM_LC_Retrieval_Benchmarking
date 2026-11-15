@@ -41,8 +41,8 @@ def execute_operation(state: WorkflowState, request: AnalysisRequest, config: Ap
     implementations = [datasets, metrics, tm_analysis, tm_solvers]
     if request.operation == "bench.retrieve":
         from analysis import bench_analysis
-        from bench import config as bench_config, optical_bench, acquisition, plots
-        implementations.extend([bench_analysis, bench_config, optical_bench, acquisition, plots])
+        from bench import config as bench_config, optical_bench, acquisition, plots, matrices, geometry
+        implementations.extend([bench_analysis, bench_config, optical_bench, acquisition, plots, matrices, geometry])
     snapshot_root = directory / "reviewed_sources"
     snapshot_root.mkdir()
     for implementation in implementations:

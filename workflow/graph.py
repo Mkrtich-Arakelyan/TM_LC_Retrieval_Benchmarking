@@ -16,11 +16,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from agents.common import ChatModel, DEFAULT_ARCHITECTURE_PATH
-from agents.experimentor import experimentor
+from agents.experimentor import experimentor, ProcedureValidationError
 from agents.orchestrator import (TERMINAL, ask, block, experimentor_route, explain,
                                  route, scientist_route, stop)
 from agents.runner import runner
-from agents.scientist import scientist
+from agents.scientist import ScientistOutputValidationError, scientist
 from agents.analyst import analyst
 from workflow.config import AppConfig
 from workflow.state import (AcquisitionResult, ConversationEntry, HumanApproval,
@@ -129,10 +129,15 @@ class WorkflowApp:
         return {"configurable": {"thread_id": str(UUID(str(workflow_id)))},
                 "recursion_limit": 10000}
 
-    def _cfg(self, state: WorkflowState) -> AppConfig:
-        return AppConfig.model_validate(state.control.configuration)
+    def _cfg(self, state: WorkflowState, *, verify_source=False) -> AppConfig:
+        config = AppConfig.model_validate(state.control.configuration)
+        if verify_source and config.hardware_backend == "simulated" and config.optical_bench is not None:
+            from bench.matrices import verify_matrix_source
+            verify_matrix_source(config.optical_bench)
+        return config
 
     def _services(self, state: WorkflowState) -> Integrations:
+        self._cfg(state, verify_source=True)  # Also guard cached services.
         if state.control.fixture_mode:
             if state.id not in self._resolved:
                 from fixtures.offline import offline_integrations
@@ -165,6 +170,12 @@ class WorkflowApp:
                 "state": state.model_dump(mode="json")}
 
     def _drive(self, workflow_id, value=None) -> dict:
+        snapshot = self.graph.get_state(self._thread(workflow_id))
+        cancelling = isinstance(value, Command) and isinstance(value.resume, dict) and value.resume.get("action") == "cancel"
+        if snapshot.values and not cancelling:
+            saved = _state(snapshot.values)
+            if saved.status not in TERMINAL:
+                self._cfg(saved, verify_source=True)
         # Sync durability commits reservations before advancing to side effects.
         self.graph.invoke(value, self._thread(workflow_id), durability="sync")
         return self.show(workflow_id)
@@ -185,6 +196,9 @@ class WorkflowApp:
             for field in ("workflow_database_path", "papers_path", "index_path", "hardware_input_path", "numerical_input_path"):
                 setattr(cfg, field, getattr(cfg, field).resolve())
             cfg.run_output_path = (cfg.run_output_path / str(state.id)).resolve()
+            if cfg.hardware_backend == "simulated" and cfg.optical_bench is not None and not fixture:
+                from bench.workflow import prepare_simulation
+                prepare_simulation(cfg)
             if fixture:
                 cfg.llm_router_enabled = False
                 cfg.hardware_backend = "test"
@@ -216,6 +230,7 @@ class WorkflowApp:
             snapshot = self.graph.get_state(self._thread(workflow_id))
             current = self.show(workflow_id)
             state = WorkflowState.model_validate(current["state"])
+            self._cfg(state, verify_source=True)
             if state.status in TERMINAL or current["pending"]:
                 return current
             if state.status == "blocked":
@@ -273,7 +288,7 @@ class WorkflowApp:
 
     def _queue_router(self, state, source, outcome):
         state.control.router_event = {"source": source, "outcome": outcome}
-        route(state, "router", state.control.task, f"{source} outcome saved → scientific routing LLM")
+        route(state, "router", state.control.task, f"{source} outcome saved → scientific routing LLM", kind="trace")
 
     def _router(self, data):
         state = _state(data)
@@ -285,7 +300,7 @@ class WorkflowApp:
             if action is None or decision.status != "accepted":
                 block(state, "Routing LLM decision rejected: " + (decision.error or decision.reason) + ". Saved records are preserved; correct the response/integration and resume.")
                 return _update(state)
-            if action.kind in ("prepare_procedure", "revise_procedure", "preflight"):
+            if action.kind in ("prepare_procedure", "revise_procedure", "plan_follow_up", "preflight"):
                 state.control.active_proposal_ids = [action.proposal_id, *[
                     key for key in state.control.active_proposal_ids if key != action.proposal_id]]
                 state.control.active_approval_id = None
@@ -295,7 +310,7 @@ class WorkflowApp:
             elif action.kind == "advise":
                 state.control.analyst_stage = "before_acquisition"
                 route(state, "analyst", "procedure", decision.reason)
-            elif action.kind in ("prepare_procedure", "revise_procedure"):
+            elif action.kind in ("prepare_procedure", "revise_procedure", "plan_follow_up"):
                 route(state, "experimentor", "procedure" if action.kind == "prepare_procedure" else "technical_review", decision.reason)
             elif action.kind == "preflight":
                 route(state, "preflight", "procedure", decision.reason)
@@ -353,7 +368,7 @@ class WorkflowApp:
                         "analyst": "planning" if c.analyst_stage == "before_acquisition" else "interpreting",
                         "experimentor": "planning", "preflight": "planning",
                         "acquire": "acquiring", "analyze": "analyzing"}[c.next_node]
-        explain(state, f"Workflow step {c.steps}: {c.next_node}, task={c.task}.")
+        explain(state, f"Workflow step {c.steps}: {c.next_node}, task={c.task}.", kind="trace")
         return _update(state)
 
     def _scientist(self, data):
@@ -364,7 +379,7 @@ class WorkflowApp:
                 block(state, "Scientist model is unconfigured. Inject workflow.graph.Integrations(scientist_model=...) or explicitly select offline fixture mode.")
                 return _update(state)
             result = scientist(state, services.scientist_model, state.control.literature_context,
-                               architecture_path=state.control.architecture_path)
+                               architecture_path=state.control.architecture_path, config=self._cfg(state))
             state = result.state
             if self._router_enabled(state):
                 if result.outcome.kind == "proposal":
@@ -378,6 +393,9 @@ class WorkflowApp:
                 scientist_route(state, result.outcome)
             if state.control.next_node == "experimentor" and state.control.task == "procedure":
                 self._analyst_handoff(state, "before_acquisition")
+        except ScientistOutputValidationError as exc:
+            state = exc.state
+            block(state, str(exc))
         except Exception as exc:
             block(state, f"Scientist failed: {exc}. Correct the integration or supplied context, then resume.")
         return _update(state)
@@ -409,8 +427,22 @@ class WorkflowApp:
                 analysis_ids = state.control.router_analysis_ids
             result = analyst(state, model, stage=stage, analysis_ids=analysis_ids,
                              literature_context=state.control.literature_context,
-                             architecture_path=state.control.architecture_path)
+                             architecture_path=state.control.architecture_path, config=self._cfg(state),
+                             acquisition_capabilities=(self._services(state).hardware_backend.describe().model_dump(mode="json")
+                                 if self._services(state).hardware_backend else None))
             state = result.state
+            if stage == "after_analysis" and result.outcome.recovery:
+                from workflow.routing_catalog import recovery_follow_up
+                follow = recovery_follow_up(state, self._cfg(state), self._services(state))
+                if follow and not follow["supported"]:
+                    note = "Recovery unresolved: " + follow["reason"] + "; " + "; ".join(follow["missing"])
+                    state.analyst_reviews[-1].limitations.append(note)
+                    explain(state, note)
+                elif follow and not self._router_enabled(state):
+                    state.control.active_proposal_ids = list(result.outcome.proposal_ids)
+                    state.control.active_approval_id = None
+                    route(state, "experimentor", "technical_review", "Analyst recommends a supported discriminating measurement; plan a new reviewed procedure")
+                    return _update(state)
             if self._router_enabled(state):
                 self._queue_router(state, "analyst", result.outcome.model_dump(mode="json"))
                 return _update(state)
@@ -462,6 +494,10 @@ class WorkflowApp:
             if result.outcome.kind == "procedure" and state.control.task == "technical_review" and result.outcome.procedure.version > 1:
                 state.control.procedure_revisions += 1
             experimentor_route(state, result.outcome)
+        except ProcedureValidationError as exc:
+            state = exc.state
+            state.control.active_approval_id = None
+            block(state, str(exc))
         except Exception as exc:
             if "Procedure revision limit" in str(exc):
                 stop(state, str(exc))
@@ -484,6 +520,17 @@ class WorkflowApp:
 
     def _preflight_issues(self, state, result):
         issues = " ".join(result.technical_issues)
+        if self._cfg(state).hardware_backend == "simulated":
+            if "Procedure validation error:" in issues:
+                if state.control.procedure_revisions < self._cfg(state).max_procedure_revisions:
+                    route(state, "experimentor", "technical_review", "Internal procedure repair required: " + issues)
+                else:
+                    block(state, "Procedure validation error: " + issues + "; procedure revision budget exhausted")
+                return
+            if any(term in issues for term in ("Unresolved prerequisite", "verified calibration", "Unknown required limits", "Unverified equipment", "Invalid input/calibration")):
+                block(state, "Preflight validation error: procedure.prerequisites/calibration/capabilities: " + issues
+                      + ". Verification must come from the configured backend, not procedure prose or user confirmation.")
+                return
         if any(term in issues for term in ("disabled", "unavailable", "Backend preflight failed", "bounded execution")):
             block(state, "Hardware integration is blocked: " + issues + " Configure a verified backend; architecture specifications do not supply safe limits.")
         elif any(term in issues for term in ("Unresolved prerequisite", "verified calibration", "Unknown required limits", "Unverified equipment", "Invalid input/calibration")):
@@ -617,6 +664,12 @@ class WorkflowApp:
         return _update(state)
 
     def _saved_acquisition_analysis(self, state, acquisition):
+        cfg = self._cfg(state)
+        if cfg.hardware_backend == "simulated":
+            from tools.tm_numerics import OPERATIONS
+            if not cfg.reviewed_numerics_enabled or "bench.retrieve" not in OPERATIONS:
+                block(state, "Analysis capability unavailable: bench.retrieve requires an enabled, registered reviewed numerical operation. Saved acquisition retained; no new acquisition is needed.")
+                return
         if self._router_enabled(state):
             self._queue_router(state, "runner", {"kind": "acquisition_completed", "record_id": str(acquisition.id),
                 "data_origin": acquisition.data_origin, "status": acquisition.status})

@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from agents.scientist import DEFAULT_SYSTEM_PROMPT, ScientistOutcome, scientist
+from workflow.config import AppConfig
 from workflow.state import (
     AcquisitionResult, Artifact, ConversationEntry, ExperimentProposal,
     LiteraturePassage, NumericalAnalysisResult, Setting, WorkflowState,
@@ -18,7 +19,7 @@ class FakeChatModel:
         self.calls = []
 
     def with_structured_output(self, schema):
-        assert schema is ScientistOutcome
+        assert issubclass(schema, ScientistOutcome)
         return self
 
     def invoke(self, messages):
@@ -122,8 +123,9 @@ def test_invented_citation_rejected(architecture, location):
         response[location] = ["invented-paper"]
     state = WorkflowState(user_request="Compare")
     before = state.model_dump_json()
-    with pytest.raises(ValueError, match="Unknown literature source identifiers.*invented-paper"):
+    with pytest.raises(ValueError, match="Scientist output validation error.*invented-paper") as invalid:
         scientist(state, FakeChatModel(response), architecture_path=architecture)
+    assert "Unknown literature source identifiers" in str(invalid.value)
     assert state.model_dump_json() == before
 
 
@@ -236,3 +238,61 @@ def test_duplicate_record_ids_are_rejected(architecture):
     response["proposals"].append(response["proposals"][0])
     with pytest.raises(ValueError, match="duplicate record ID"):
         scientist(WorkflowState(user_request="Plan"), FakeChatModel(response), architecture_path=architecture)
+
+
+def test_citation_schema_constrains_every_proposal_and_top_level(architecture):
+    from agents.scientist import _citation_schema
+    from pydantic import ValidationError
+
+    schema = _citation_schema(["HUANG-S2", "RAFAYELYAN-APP-A"])
+    definition = schema.model_json_schema()
+    ids = definition["properties"]["cited_source_ids"]["items"]["enum"]
+    proposal = definition["$defs"]["CitedExperimentProposal"]
+    assert ids == proposal["properties"]["literature_references"]["items"]["enum"]
+    response = proposal_response()
+    response["cited_source_ids"] = ["HUANG-S2"]
+    response["proposals"][0]["literature_references"] = ["RAFAYELYAN-APP-A"]
+    schema.model_validate(response)
+    response["proposals"].append({**response["proposals"][0], "id": uuid4(),
+                                   "literature_references": ["HUANG-S2: explanation"]})
+    with pytest.raises(ValidationError) as invalid:
+        schema.model_validate(response)
+    assert invalid.value.errors()[0]["loc"] == ("proposals", 1, "literature_references", 0)
+
+
+@pytest.mark.parametrize("citation", ["HUANG-S2: explanation", " HUANG-S2 ", "UNKNOWN"])
+def test_citation_repair_never_guesses_or_normalizes_ids(architecture, citation):
+    passage = LiteraturePassage(source_id="HUANG-S2", filename="paper.pdf", passage="Supplied passage")
+    response = proposal_response()
+    response["cited_source_ids"] = [citation]
+    model = FakeChatModel(response)
+    with pytest.raises(ValueError, match="Scientist output validation error"):
+        scientist(WorkflowState(user_request="Compare"), model, [passage], architecture_path=architecture)
+    assert len(model.calls) == 2
+    error = json.loads(model.calls[1][1][1])["scientist_validation"]["errors"][0]
+    assert error["field"] == "cited_source_ids.0" and error["invalid_value"] == citation
+    assert error["allowed_source_ids"] == ["HUANG-S2"]
+
+
+def test_citation_retry_respects_workflow_call_limit(architecture):
+    response = proposal_response()
+    response["cited_source_ids"] = ["invented"]
+    model = FakeChatModel(response)
+    with pytest.raises(ValueError, match="Scientist output validation error"):
+        scientist(WorkflowState(user_request="Compare"), model, architecture_path=architecture,
+                  config=AppConfig(max_workflow_iterations=1))
+    assert len(model.calls) == 1
+
+
+def test_invalid_citation_cannot_turn_into_user_clarification_on_retry(architecture):
+    class AskingModel(FakeChatModel):
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return {**proposal_response(), "cited_source_ids": ["HUANG-S2: explanation"]}
+            return information_response()
+
+    model = AskingModel(None)
+    with pytest.raises(ValueError, match="Scientist output validation error.*request_information"):
+        scientist(WorkflowState(user_request="Compare"), model, architecture_path=architecture)
+    assert len(model.calls) == 2

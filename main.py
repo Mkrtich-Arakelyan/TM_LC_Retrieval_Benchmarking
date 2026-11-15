@@ -8,9 +8,8 @@ from uuid import uuid4
 from workflow.config import AppConfig, DEFAULT_ARCHITECTURE_PATH
 from workflow.graph import WorkflowApp
 from workflow.state import ConversationEntry, WorkflowState
-from workflow.report import export_decisions, export_workflow_view
+from workflow.report import conversation_entries, export_decisions, export_workflow_view
 from workflow.persistence import canonical_factory_path
-
 BENCH_FACTORY = "bench.workflow:build_integrations"
 MODEL_FACTORY = "bench.workflow:build_model_integrations"
 
@@ -21,6 +20,9 @@ def build_parser():
     parser.add_argument("--factory", help="Trusted module:function returning workflow.graph.Integrations(config)")
     parser.add_argument("--simulate", action="store_true", help="Explicit synthetic selection; never physical hardware")
     sub = parser.add_subparsers(dest="command", required=True)
+    report = sub.add_parser("report", help="Regenerate a human report from saved workflow.json; no models or execution")
+    report.add_argument("workflow_file", type=Path)
+    report.add_argument("--output", type=Path, required=True, help="Separate report directory; original artifacts stay unchanged")
     start = sub.add_parser("start")
     start.add_argument("question", nargs="?", help="Research question; simulation has a default")
     start.add_argument("--fixture", action="store_true", help="Explicit TEST ONLY offline handoffs")
@@ -102,9 +104,13 @@ def _factory(config, explicit=None):
 
 def _simulation(config, args, parser):
     from bench.config import BenchConfig
+    from bench.matrices import pin_detector_matrix
     from bench.workflow import BENCH_QUESTION, PAPER_PASSAGES, setup_context
     try:
         config.optical_bench = BenchConfig.model_validate_json(args.bench_config.read_text(encoding="utf-8-sig")) if args.bench_config else BenchConfig()
+        config.optical_bench.require_current_layout()
+        config.optical_bench = pin_detector_matrix(config.optical_bench,
+            base_directory=args.bench_config.resolve().parent if args.bench_config else None)
     except (ValueError, OSError) as exc:
         parser.error(f"Invalid synthetic bench configuration: {exc}")
     config.hardware_backend = "simulated"
@@ -175,15 +181,22 @@ def _continue(app, args, environment):
 def _render(view, config, old_count=0):
     root = export_workflow_view(view)
     simulated = view["state"]["control"]["configuration"].get("hardware_backend") == "simulated"
-    if simulated:
+    if (simulated or view["state"]["control"]["configuration"].get("optical_bench") is not None
+            or any(a.get("method_settings", {}).get("operation") == "bench.retrieve" for a in view["state"]["analyses"])):
         export_decisions(view)
     print(f"Workflow {view['workflow_id']}: {view['status']}")
     if view.get("reason"):
         print(view["reason"])
     if view.get("input_error"):
         print("Input rejected; workflow unchanged: " + view["input_error"])
-    for entry in view["state"]["conversation"][old_count:]:
-        print(f"\n[{entry['role']}] {entry['message']}")
+    for entry in conversation_entries({"conversation": view["state"]["conversation"][old_count:]}):
+        label = "Experimentalist" if entry["role"] == "experimentor" else entry["role"].title()
+        if entry.get("recipient"):
+            label += " → " + ("Experimentalist" if entry["recipient"] == "experimentor" else entry["recipient"].title())
+        if entry["role"] == "runner":
+            label += " — execution event (program-generated)"
+        print(f"\n[{label}]\n{entry['message']}")
+    print(f"\nConversation: {root / 'conversation.md'}\nDetailed trace: {root / 'agent-messages.md'}")
     print(f"\nSaved workflow: {root}")
     command = f'python main.py --db "{config.workflow_database_path}"'
     selection = " --simulate" if simulated else ""
@@ -209,6 +222,15 @@ def main(argv=None, *, app_factory=None) -> int:
     args = parser.parse_args(argv)
     args.factory = canonical_factory_path(args.factory)
     _validate(args, parser)
+    if args.command == "report":
+        from workflow.report import regenerate_report
+        try:
+            root = regenerate_report(args.workflow_file, args.output)
+            print(f"Report: {root / 'run-summary.md'}\nConversation: {root / 'conversation.md'}\nDetailed trace: {root / 'agent-messages.md'}")
+            return 0
+        except (ValueError, OSError) as exc:
+            print(f"Report error: {exc}")
+            return 2
     environment = AppConfig.from_env().model_copy(deep=True)
     if args.db:
         environment.workflow_database_path = args.db
@@ -241,6 +263,9 @@ def main(argv=None, *, app_factory=None) -> int:
         if args.command == "resume" and args.refresh_config and saved.get("optical_bench") is not None:
             parser.error("Bench workflows retain saved settings and agent mode; start a new run to change configuration")
         config = _saved_config(previous, environment)
+        if args.command != "cancel" and config.hardware_backend == "simulated" and config.optical_bench is not None:
+            from bench.matrices import verify_matrix_source
+            verify_matrix_source(config.optical_bench)
         with _open(application, config, _factory(config, args.factory)) as app:
             result = _continue(app, args, environment)
         return _render(result, config)

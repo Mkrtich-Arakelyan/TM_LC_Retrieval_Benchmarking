@@ -8,7 +8,7 @@ import numpy as np
 
 from workflow.state import (AcquisitionResult, AnalysisRequest, Artifact, ExperimentProposal,
                    Setting, TMFitSettings, WorkflowState)
-from fixtures.offline import FixtureAnalystModel
+from fixtures.offline import FixtureAnalystModel, local_handoffs
 from tools.python_execution import fingerprint
 
 
@@ -63,6 +63,7 @@ class NumericalFixtureAnalyst(FixtureAnalystModel):
     def __init__(self, request):
         self.request = request
 
+    @local_handoffs("analyst")
     def invoke(self, messages):
         payload = json.loads(messages[1][1])
         if not payload["workflow_state"]["analyses"]:

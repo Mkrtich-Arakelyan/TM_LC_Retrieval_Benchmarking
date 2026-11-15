@@ -218,9 +218,19 @@ class AnalysisCode(Record):
     scientific_context: ScientificContext
 
 
+class AgentHandoff(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recipient: Role
+    message: str = Field(min_length=1, pattern=r"\S")
+    reply_to: UUID | None = None
+
+
 class ConversationEntry(Record):
     role: Role
-    message: Text
+    message: str = Field(min_length=1, pattern=r"\S")  # Preserve original whitespace.
+    kind: Literal["legacy", "handoff", "trace", "decision", "execution_event"] = "legacy"
+    recipient: Role | None = None
+    reply_to: UUID | None = None
     record_ids: list[UUID] = Field(default_factory=list)
     scientific_context: ScientificContext | None = None
 
@@ -253,6 +263,33 @@ class AnalysisRequest(BaseModel):
         return self
 
 
+class RecoveryClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["supported", "unresolved", "not_assessed"] = "unresolved"
+    reason: Text
+    affected_detectors: list[int] = Field(default_factory=list)
+
+
+class MeasurementFollowUp(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    unresolved_question: Text
+    measurement: Text
+    distinguishing_result: Text
+    required_actions: list[Text] = Field(min_length=1)
+    required_parameters: dict[Text, list[Text]] = Field(default_factory=dict)
+    missing_capabilities: list[Text] = Field(default_factory=list)
+
+
+class RecoveryAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    task_goal: Literal["brightness_prediction", "input_mapping", "complex_matrix"]
+    brightness_prediction: RecoveryClaim
+    input_mapping: RecoveryClaim
+    complex_matrix: RecoveryClaim
+    method_ambiguities: list[Text] = Field(min_length=1)
+    follow_up: MeasurementFollowUp | None = None
+
+
 class AnalystReview(Record):
     stage: Literal["before_acquisition", "after_analysis"]
     status: Literal["advised", "reviewed", "needs_information", "more_analysis"]
@@ -266,6 +303,8 @@ class AnalystReview(Record):
     questions: list[Text] = Field(default_factory=list)
     analysis_request: AnalysisRequest | None = None
     cited_source_ids: list[Text] = Field(default_factory=list)
+    recovery: RecoveryAssessment | None = None  # Old saved reviews remain readable.
+    handoff: AgentHandoff | None = None
     # Derived by code from source records, never trusted from the model.
     provenance: dict[str, list[str]] = Field(default_factory=dict)
 

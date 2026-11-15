@@ -5,11 +5,14 @@ the bench object, its matrix, or its intermediate complex fields into agent stat
 """
 
 
+import hashlib
+
 import numpy as np
 
-from agents.experimentor import UNRESOLVED_PREREQUISITES
 from bench.config import BenchConfig
 from bench.acquisition import run_acquisition
+from bench.matrices import load_detector_matrix, pin_detector_matrix, verify_matrix_source
+from bench.geometry import detector_regions, geometry_metadata, slm_phase_pattern
 from tools.hardware import (ActionReport, ActionSpec, HardwareCapabilities,
                             ParameterSpec, Verification, canonical_hash, parameter_issues)
 
@@ -32,13 +35,10 @@ def pattern_to_camera(matrix, inputs, *, shutter_seconds, laser_power_mw,
     return np.clip(np.rint(response), 0, 255).astype(np.uint8)
 
 
-def detector_regions(side):
-    return [(2, 4, 2, 4), (2, 4, side - 4, side - 2),
-            (side - 4, side - 2, 2, 4), (side - 4, side - 2, side - 4, side - 2)]
-
-
 class OpticalBench:
     def __init__(self, config: BenchConfig):
+        config.require_current_layout()
+        config = pin_detector_matrix(config)
         self.config = config
         self.regions = detector_regions(config.frame_side)
         rng = np.random.default_rng(config.seed)
@@ -55,9 +55,32 @@ class OpticalBench:
             # Uniform coherent response within each ROI: its mean is a rank-one
             # intensity channel. Arbitrary pixel mixtures need a different model.
             matrix[y0:y1, x0:x1] = row
+        if config.detector_matrix_path is not None:
+            rows, _ = load_detector_matrix(config)
+            for row, (y0, y1, x0, x1) in zip(rows, self.regions):
+                matrix[y0:y1, x0:x1] = row  # Exact supplied coefficients; no normalization.
+        detector_rows = np.stack([matrix[y0, x0] for y0, _, x0, _ in self.regions])
+        self.__metadata = {
+            **geometry_metadata(),
+            "matrix_mode": "known" if config.detector_matrix_path is not None else "seeded_random",
+            "matrix_fingerprint": hashlib.sha256(detector_rows.astype("<c16").tobytes()).hexdigest(),
+        }
+        if config.detector_matrix_sha256 is not None:
+            self.__metadata["matrix_source_sha256"] = config.detector_matrix_sha256
         self.__matrix = matrix
 
+    @property
+    def metadata(self):
+        return dict(self.__metadata)
+
+    def _evaluation_detector_rows(self, expected_fingerprint):
+        """Evaluation-only access; never called by agents, acquisition or fitting."""
+        if not expected_fingerprint or self.__metadata["matrix_fingerprint"] != expected_fingerprint:
+            raise ValueError("Reconstructed truth does not match the run's recorded matrix fingerprint")
+        return np.stack([self.__matrix[y0, x0].copy() for y0, _, x0, _ in self.regions])
+
     def frame(self, phases, shutter, power, *, capture_index=0):
+        verify_matrix_source(self.config)
         phases = np.asarray(phases)
         if phases.shape != (self.config.input_regions,) or phases.dtype.kind not in "fiu" or not np.isfinite(phases).all():
             raise ValueError("One finite phase in radians per input region is required")
@@ -65,7 +88,11 @@ class OpticalBench:
             raise ValueError("Shutter outside synthetic limits")
         if not self.config.power_min <= power <= self.config.power_max:
             raise ValueError("Laser power outside synthetic limits")
-        return pattern_to_camera(self.__matrix, np.exp(1j * phases), shutter_seconds=shutter,
+        # Each 2 x 2 SLM region has one phase and one effective unit-amplitude
+        # input. TM coefficients integrate the four SLM pixels' contribution.
+        active_slm = slm_phase_pattern(phases)
+        inputs = np.exp(1j * active_slm[::2, ::2].ravel())
+        return pattern_to_camera(self.__matrix, inputs, shutter_seconds=shutter,
             laser_power_mw=power, background=self.config.background_counts,
             noise_std=self.config.read_noise_std,
             rng=np.random.default_rng(np.random.SeedSequence([self.config.seed, capture_index, 901])))
@@ -74,24 +101,31 @@ class OpticalBench:
 class SimulatedBackend:
     """One bounded calibration + intensity-only sequence; no physical integration."""
     def __init__(self, config: BenchConfig):
-        self.config = config
         self.__bench = OpticalBench(config)
+        self.config = self.__bench.config
 
     def describe(self):
         cfg = self.config
+        cfg.require_current_layout()
+        verify_matrix_source(cfg)
         def number(unit, low, high):
             return ParameterSpec(kind="number", unit=unit, verified=True, minimum=low, maximum=high)
         exact = ParameterSpec(kind="integer", unit="frame", verified=True,
                               minimum=cfg.frame_budget, maximum=cfg.frame_budget)
-        prerequisites = {s: Verification(verified=True, evidence="Synthetic model contract only; no laboratory verification")
-                         for s in [*UNRESOLVED_PREREQUISITES, "synthetic phase mapping verified"]}
+        prerequisites = {
+            "synthetic bench configuration valid": Verification(verified=True,
+                evidence="Bench settings, fixed geometry, and any pinned matrix source validated by the simulator; not laboratory verification"),
+            "synthetic phase mapping verified": Verification(verified=True,
+                evidence="Simulator accepts sixteen phase-in-radians controls with equal input amplitudes; no physical command calibration claimed"),
+        }
         return HardwareCapabilities(backend_id="synthetic-optical-bench", revision=canonical_hash(cfg.model_dump()),
             available=True, data_origin="simulated", supports_deadlines=True, supports_cancellation=True,
             supports_cleanup=True, prerequisites=prerequisites,
             actions={"bench.acquire": ActionSpec(parameters={
                 "shutter_seconds": number("s", cfg.shutter_min, cfg.shutter_max),
                 "laser_power_mw": number("mW", cfg.power_min, cfg.power_max),
-                "frame_budget": exact}, measurement_count_setting="frame_budget")})
+                "frame_budget": exact}, measurement_count_setting="frame_budget",
+                required_prerequisites=list(prerequisites))})
 
     def validate(self, procedure):
         if len(procedure.actions) != 1 or procedure.actions[0].action != "bench.acquire":

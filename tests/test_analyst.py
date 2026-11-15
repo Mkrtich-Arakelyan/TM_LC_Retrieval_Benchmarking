@@ -183,7 +183,7 @@ def test_both_workflow_handoffs_and_restart(workflow):
         final = app.submit(waiting["workflow_id"], approve(waiting))
         assert final["status"] == "completed"
         assert [r["stage"] for r in final["state"]["analyst_reviews"]] == ["before_acquisition", "after_analysis"]
-        roles = [c["role"] for c in final["state"]["conversation"] if c["role"] != "orchestrator"]
+        roles = [c["role"] for c in final["state"]["conversation"] if c["role"] != "orchestrator" and c.get("kind") != "handoff"]
         assert roles == ["scientist", "analyst", "experimentor", "runner", "human", "runner", "experimentor", "analyst", "scientist"]
         ids = [c["id"] for c in final["state"]["conversation"]]
         assert len(ids) == len(set(ids))

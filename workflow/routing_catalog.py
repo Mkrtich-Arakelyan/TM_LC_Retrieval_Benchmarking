@@ -24,13 +24,49 @@ class AvailableAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = ""
     kind: Literal["propose", "advise", "prepare_procedure", "revise_procedure", "preflight",
-                  "run_operation", "review_results", "interpret", "request_information", "conclude"]
+                  "run_operation", "review_results", "interpret", "request_information", "conclude", "plan_follow_up"]
     description: str
     record_ids: list[UUID] = Field(default_factory=list)
     proposal_id: UUID | None = None
     procedure_id: UUID | None = None
     analysis_ids: list[UUID] = Field(default_factory=list)
     request: AnalysisRequest | None = None
+
+
+def recovery_follow_up(state, config, services):
+    """Capability/budget gate only. The Analyst owns scientific discrimination."""
+    review = next((r for r in reversed(state.analyst_reviews) if r.stage == "after_analysis" and r.status == "reviewed"), None)
+    if not review or not review.recovery:
+        return None
+    assessment = review.recovery
+    if assessment.task_goal == "brightness_prediction":
+        return None
+    claim = assessment.input_mapping if assessment.task_goal == "input_mapping" else assessment.complex_matrix
+    if claim.status == "supported":
+        return None
+    follow = assessment.follow_up
+    missing = list(follow.missing_capabilities) if follow else ["No discriminating measurement was specified"]
+    if follow:
+        try:
+            caps = services.hardware_backend.describe() if services.hardware_backend else None
+            for name in set(follow.required_actions) | set(follow.required_parameters):
+                if caps is None or not caps.available or name not in caps.actions:
+                    missing.append(f"Unavailable acquisition action: {name}")
+                    continue
+                for key in follow.required_parameters.get(name, []):
+                    rule = caps.actions[name].parameters.get(key)
+                    if rule is None or not rule.verified:
+                        missing.append(f"Missing verified control: {name}.{key}")
+        except Exception as exc:
+            missing.append(f"Cannot verify acquisition capabilities: {exc}")
+    if state.control.acquisition_attempts >= config.max_workflow_acquisition_attempts:
+        missing.append("Acquisition attempt limit reached")
+    if state.control.procedure_revisions >= config.max_procedure_revisions:
+        missing.append("Procedure revision limit reached")
+    if config.hardware_backend == "disabled" or services.experimentor_model is None:
+        missing.append("Acquisition planning/backend unavailable")
+    return {"review_id": str(review.id), "supported": not missing, "missing": list(dict.fromkeys(missing)),
+            "reason": claim.reason, "recommendation": follow.model_dump(mode="json") if follow else None}
 
 
 def _checked_json(ref, config):
@@ -67,7 +103,7 @@ def dataset_inventory(state: WorkflowState, config: AppConfig):
                         "dataset_artifact_id": str(ref.id), "input_record_id": str(acquisition.id),
                         "description": ref.description, "data_origin": "simulated",
                         "patterns": len(data["phases"]), "input_modes": data["phases"].shape[1],
-                        "output_channels": 4, "fit_count": manifest["fit_patterns"],
+                        "output_channels": data["detector_readings"].shape[1], "fit_count": manifest["fit_patterns"],
                         "holdout_count": manifest["holdout_patterns"], "equal_input_amplitudes": True,
                         "clipped_readings": int((data["detector_saturation"] > 0).sum()),
                         "ground_truth_artifact_id": None})
@@ -125,6 +161,7 @@ def build_catalog(state: WorkflowState, config: AppConfig, services):
     if services.scientist_model is not None:
         add("propose", "Ask Scientist to propose or revise the scientific plan")
     active = [p for p in state.proposals if p.id in state.control.active_proposal_ids]
+    follow_up = recovery_follow_up(state, config, services)
     if active and services.analyst_model is not None and not any(
         r.stage == "before_acquisition" and r.status == "advised" and set(p.id for p in active) <= set(r.proposal_ids)
         for r in state.analyst_reviews):
@@ -136,10 +173,24 @@ def build_catalog(state: WorkflowState, config: AppConfig, services):
             if not procedures:
                 add("prepare_procedure", "Prepare an acquisition procedure; execution still needs preflight and human approval",
                     record_ids=[proposal.id], proposal_id=proposal.id)
-            elif state.control.procedure_revisions < config.max_procedure_revisions:
+            elif state.control.procedure_revisions < config.max_procedure_revisions and not follow_up:
                 proc = max(procedures, key=lambda p: p.version)
                 add("revise_procedure", "Request a technical procedure revision; a revision requires fresh review/approval",
                     record_ids=[proposal.id, proc.id], proposal_id=proposal.id, procedure_id=proc.id)
+    if follow_up:
+        if follow_up["supported"] and active:
+            review = next(r for r in state.analyst_reviews if str(r.id) == follow_up["review_id"])
+            source_procedures = {a.procedure_id for a in state.acquisitions for result in state.analyses
+                                 if result.id in review.analysis_ids and a.id in result.acquisition_ids}
+            for proposal in active:
+                procedures = [p for p in state.procedures if p.proposal_id == proposal.id]
+                source_versions = [p.version for p in procedures if p.id in source_procedures]
+                if procedures and source_versions and max(p.version for p in procedures) <= max(source_versions):
+                    proc = max(procedures, key=lambda p: p.version)
+                    add("plan_follow_up", "Plan Analyst's discriminating follow-up using verified controls; requires new preflight and human approval",
+                        record_ids=[review.id, proposal.id, proc.id], proposal_id=proposal.id, procedure_id=proc.id)
+        else:
+            limitations.append("Recovery unresolved: " + follow_up["reason"] + "; " + "; ".join(follow_up["missing"]))
     if can_acquire:
         for proc in state.procedures:
             if proc.proposal_id not in {p.id for p in active} or any(

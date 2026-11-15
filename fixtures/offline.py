@@ -1,6 +1,7 @@
 """Explicit offline handoff fixtures. No generated script execution or optical model."""
 
 import json
+from functools import wraps
 from uuid import UUID, uuid5
 
 from agents.experimentor import ExecutionReview, UNRESOLVED_PREREQUISITES
@@ -10,11 +11,34 @@ from tools.hardware import Verification
 from tools.python_execution import BackendReport, fingerprint
 
 
+def local_handoffs(role):
+    """Canned messages authored by these model doubles during invoke, not exports."""
+    def decorate(invoke):
+        @wraps(invoke)
+        def response(self, messages):
+            result = invoke(self, messages)
+            payload = json.loads(messages[1][1])
+            if payload.get("handoff_required") and (role != "experimentor" or "kind" in result):
+                recipient = ("experimentor" if result.get("kind") == "proposal" or result.get("stage") == "before_acquisition"
+                             else "analyst" if role == "experimentor" else "scientist" if role == "analyst" else "orchestrator")
+                text = {"experimentor": "Experimentalist, use the structured proposal and advice to plan verified measurements; keep a separate held-out set.",
+                        "analyst": "Analyst, please evaluate the saved measurements and distinguish brightness prediction from matrix recovery.",
+                        "scientist": "Scientist, please interpret the recorded quality and recovery assessment, including its unresolved limitations.",
+                        "orchestrator": "Orchestrator, the interpretation is recorded; conclude with the stated evidence and limitations."}[recipient]
+                incoming = payload.get("handoffs", [])
+                result["handoff"] = {"recipient": recipient, "message": text,
+                                     "reply_to": incoming[-1]["id"] if incoming else None}
+            return result
+        return response
+    return decorate
+
+
 class FixtureScientistModel:
     def with_structured_output(self, schema):
         self.schema = schema
         return self
 
+    @local_handoffs("scientist")
     def invoke(self, messages):
         state = json.loads(messages[1][1])["workflow_state"]
         if state["control"]["task"] == "interpretation" and state["analyses"]:
@@ -46,6 +70,7 @@ class FixtureExperimentorModel:
         self.schema = schema
         return self
 
+    @local_handoffs("experimentor")
     def invoke(self, messages):
         payload = json.loads(messages[1][1])
         state = payload["workflow_state"]
@@ -92,11 +117,34 @@ class FixtureExecutionBackend:
             outputs=[Artifact(path=str(path), description="TEST ONLY handoff artifact, not numerical evidence from a physical experiment")])
 
 
+def local_recovery_assessment(payload, goal="complex_matrix"):
+    """Conservative canned reasoning for offline tests, never a recovery oracle."""
+    evidence = payload.get("recovery_evidence", [])
+    measured = next((e["measurements"] for e in evidence if "measurements" in e), {})
+    metrics = evidence[-1]["metrics"] if evidence else {}
+    detectors = [d["detector"] for d in measured.get("per_detector", [])]
+    unresolved = {"status": "unresolved", "affected_detectors": detectors,
+        "reason": "LOCAL TEST DOUBLE: no uniqueness/discrimination evidence; variation, pattern rank, enough samples and prediction accuracy alone do not establish connections or complex coefficients."}
+    follow = None
+    if measured.get("equal_amplitude_inputs") and goal != "brightness_prediction":
+        follow = {"unresolved_question": "Which individual inputs contribute to each detector, with what strengths?",
+            "measurement": "Individually switch each input on while the others are off, then use pairwise interference measurements if relative phases are required",
+            "distinguishing_result": "Single-input detector brightness distinguishes alternative input assignments and connection strengths; phase-scanned pairs distinguish relative complex phases. Additional equal-amplitude phase-only frames or global exposure/power scaling do not separate sparse-input assignments.",
+            "required_actions": ["bench.acquire"], "required_parameters": {"bench.acquire": ["input_amplitudes"]},
+            "missing_capabilities": ["Verified relative-phase interference acquisition protocol"] if goal == "complex_matrix" else []}
+    return {"task_goal": goal,
+        "brightness_prediction": {"status": "supported" if metrics.get("prediction_passed") else "unresolved",
+            "reason": "LOCAL TEST DOUBLE: use the recorded held-out prediction result, distinct from matrix recovery", "affected_detectors": detectors},
+        "input_mapping": dict(unresolved), "complex_matrix": dict(unresolved),
+        "method_ambiguities": ["Intensity observations leave independent row phase unobserved; other ambiguities require discriminating evidence"], "follow_up": follow}
+
+
 class FixtureAnalystModel:
     """Canned metadata advice/review only; no numerical calculation."""
     def with_structured_output(self, schema):
         return self
 
+    @local_handoffs("analyst")
     def invoke(self, messages):
         payload = json.loads(messages[1][1])
         before = payload["stage"] == "before_acquisition"
@@ -106,7 +154,8 @@ class FixtureAnalystModel:
                 "explanation": "TEST ONLY canned Analyst metadata handoff, not a validated scientific review.",
                 "recommendations": ["Confirm coherent-reference requirements and command-to-phase calibration; specify controls and held-out data." if before else
                     "Check whether metrics answer the comparison; independent validation is not established by fixture metadata."],
-                "limitations": ["TEST ONLY fixtures; no files inspected, calculations performed, or physical conclusions established."]}
+                  "limitations": ["TEST ONLY fixtures; no files inspected, calculations performed, or physical conclusions established."],
+                  "recovery": None if before else local_recovery_assessment(payload)}
 
 
 def offline_integrations(config, workflow_id: UUID, *, include_analyst: bool = False) -> dict:
@@ -134,6 +183,7 @@ class LocalModel:
 
 
 class LocalScientist(LocalModel):
+    @local_handoffs("scientist")
     def invoke(self, messages):
         payload = json.loads(messages[1][1])
         state = payload["workflow_state"]
@@ -141,10 +191,13 @@ class LocalScientist(LocalModel):
             latest = state["analyses"][-1]
             metrics = latest["metrics"]
             passed = bool(metrics.get("prediction_passed"))
+            reviews = [r for r in state["analyst_reviews"] if r.get("recovery")]
+            recovery_note = (" Recovery assessment: " + json.dumps(reviews[-1]["recovery"]) +
+                             " Limitations: " + "; ".join(reviews[-1]["limitations"])) if reviews else ""
             return {"kind": "interpretation", "explanation": f"LOCAL TEST DOUBLE: held-out prediction {'passed' if passed else 'failed or is inconclusive'}; this is synthetic evidence, not laboratory validation.",
                 "recommended_next_step": "Inspect individual calibration and prediction artifacts",
                 "findings": [{"evidence_ids": [latest["id"]],
-                    "interpretation": f"Synthetic held-out prediction_passed={int(passed)}; measurement_passed={metrics.get('measurement_passed', 0)}.",
+                      "interpretation": f"Synthetic held-out prediction_passed={int(passed)}; measurement_passed={metrics.get('measurement_passed', 0)}." + recovery_note,
                     "limitations": ["Local canned agent reasoning", "Uniform detector ROIs and ideal stable phase-only model", "Independent detector-row phase ambiguity"],
                     "recommended_next_step": "Review evidence before improving the physical model"}]}
         proposal = ExperimentProposal(scientific_question=state["user_request"],
@@ -162,6 +215,7 @@ class LocalScientist(LocalModel):
 
 
 class LocalExperimentor(LocalModel):
+    @local_handoffs("experimentor")
     def invoke(self, messages):
         payload = json.loads(messages[1][1])
         state = payload["workflow_state"]
@@ -182,6 +236,7 @@ class LocalExperimentor(LocalModel):
 
 
 class LocalAnalyst(LocalModel):
+    @local_handoffs("analyst")
     def invoke(self, messages):
         payload = json.loads(messages[1][1])
         before = payload["stage"] == "before_acquisition"
@@ -193,7 +248,8 @@ class LocalAnalyst(LocalModel):
             "explanation": "LOCAL TEST DOUBLE: require separate holdout, clipped-fit exclusion and row-phase ambiguity." if before else
                 f"LOCAL TEST DOUBLE: measurement_passed={metrics.get('measurement_passed')}, prediction_passed={metrics.get('prediction_passed')}; inspect per-detector usable counts and held-out errors.",
             "recommendations": ["Use bench.retrieve on saved raw frames; do not use hidden fields or truth" if before else "Keep workflow completion distinct from measurement and prediction quality"],
-            "limitations": ["Local canned agent reasoning; synthetic model only"]}
+              "limitations": ["Local canned agent reasoning; synthetic model only"],
+              "recovery": None if before else local_recovery_assessment(payload, getattr(self, "task_goal", "complex_matrix"))}
 
 
 class LocalRouter(LocalModel):
@@ -203,8 +259,10 @@ class LocalRouter(LocalModel):
         latest = context["latest_agent_outcome"]
         if latest.get("kind") in ("acquisition_failed", "request_information"):
             order = ["request_information"]
+        elif latest.get("kind") == "procedure":
+            order = ["preflight", "interpret", "request_information"]
         else:
-            order = ["conclude", "run_operation", "review_results", "interpret", "advise", "preflight", "prepare_procedure", "propose", "request_information"]
+            order = ["conclude", "run_operation", "review_results", "plan_follow_up", "interpret", "advise", "preflight", "prepare_procedure", "propose", "request_information"]
         selected = next(a for kind in order for a in actions if a["kind"] == kind)
         return {"action_id": selected["id"], "record_ids": selected["record_ids"],
             "reason": "LOCAL TEST DOUBLE: " + (latest.get("explanation", "Stopped acquisition; inspect diagnostics") if selected["kind"] == "request_information" else selected["description"])}
