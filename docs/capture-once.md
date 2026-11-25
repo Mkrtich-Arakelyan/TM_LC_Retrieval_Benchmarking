@@ -96,8 +96,9 @@ No startup or live emission test was performed on the laptop.
 After all settings are validated and a fresh output directory can be created:
 
 1. Open laser serial connection, then connect SLM and load its LUT.
-2. Save a known constant-gray `uint8` image matching the queried SLM dimensions.
-   The gray value is explicit; this is a display test, not a TM acquisition.
+2. Build and save the `uint8` SLM image using the queried SLM dimensions,
+   `gray_level`, and the optional stripe rectangle. Validate the rectangle
+   before starting laser emission.
 3. Prepare and enable CH1 if the plan uses the LCC, then perform the approved
    laser startup and the lab-specified settling wait.
 4. Open/configure/arm the camera with the supplied verified external trigger.
@@ -115,6 +116,31 @@ Debounce, signal polarity, wiring, trigger delay versus optical settling, and
 whether acquisition-start triggering yields the intended first frame must be
 confirmed on the lab PC. Do not treat reference values as proof of wiring.
 `camera_trigger_confirmed` must be true only for the supplied verified settings.
+
+### Optional SLM stripe rectangle
+
+The example config sets `slm_active_rectangle` to `null` for a uniform-gray image.
+Omitting the field has the same effect. To add alternating column stripes, set
+the field to an object like this:
+
+```json
+{
+  "slm_active_rectangle": {"x": 1, "y": 2, "width": 8, "height": 4}
+}
+```
+
+`x` and `y` are the zero-based left column and top row in SLM pixels. Use
+nonnegative integers for the origin and positive integers for the dimensions.
+The rectangle must fit entirely within the SLM image. Camera ROI coordinates
+use the camera's own pixel grid.
+
+The pattern starts with `gray_level` everywhere and adds 128 to every other column
+inside the rectangle, starting at its left edge. Pixel values wrap modulo 256,
+so a base value of 200 becomes 72 in a striped column. Pixels outside the
+rectangle keep the base value. The `known_image` section in `capture-result.json`
+records the base value, `slm_active_rectangle`, and `stripe_mask_applied`.
+
+### Saved files
 
 The output directory contains individual files:
 

@@ -16,9 +16,20 @@ from hardware.laser import LabLaser, LaserSettings
 from hardware.slm import MeadowlarkSlm, SlmSettings, SlmReturnCodes
 
 
+def _validate_active_rectangle(rectangle):
+    if rectangle is None:
+        return None
+    if not isinstance(rectangle, dict) or rectangle.keys() != {"x", "y", "width", "height"}:
+        raise ValueError("slm_active_rectangle must contain x, y, width, and height")
+    for name, minimum in (("x", 0), ("y", 0), ("width", 1), ("height", 1)):
+        if type(rectangle[name]) is not int or rectangle[name] < minimum:
+            raise ValueError(f"slm_active_rectangle.{name} must be an integer >= {minimum}")
+    return rectangle.copy()
+
+
 def capture_once(*, slm, camera, laser, output_dir, gray_level, laser_settle_seconds,
-                 generator=None, lcc_plan=None):
-    """Use supplied adapters; save one constant-gray SLM image and one raw frame.
+                 generator=None, lcc_plan=None, slm_active_rectangle=None):
+    """Use supplied adapters to save one SLM image and one raw frame.
 
     The camera must be armed before the image flip. The operator must have
     verified trigger wiring/delay and optical settling. Optional LCC drive
@@ -31,17 +42,21 @@ def capture_once(*, slm, camera, laser, output_dir, gray_level, laser_settle_sec
         raise ValueError("laser_settle_seconds must be finite and nonnegative")
     if (generator is None) != (lcc_plan is None):
         raise ValueError("LCC capture requires both a generator and an explicit acquisition plan")
+    rectangle = _validate_active_rectangle(slm_active_rectangle)
     with bench_access(acquisition=True):
         return _capture(slm, camera, laser, output_dir, gray_level, laser_settle_seconds,
-                        generator, lcc_plan)
+                        generator, lcc_plan, rectangle)
 
 
-def _capture(slm, camera, laser, output_dir, gray_level, laser_settle_seconds, generator, lcc_plan):
+def _capture(slm, camera, laser, output_dir, gray_level, laser_settle_seconds,
+             generator, lcc_plan, rectangle):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=False)  # before hardware; never overwrite a run
     record_bench_run(output_dir)
+    known_image = {"kind": "constant_gray", "value": gray_level,
+                   "slm_active_rectangle": rectangle, "stripe_mask_applied": False}
     report = {"capture_status": "not_started", "last_stage": "created_output_directory",
-              "cleanup": {}, "files": [], "known_image": {"kind": "constant_gray", "value": gray_level}}
+              "cleanup": {}, "files": [], "known_image": known_image}
     attempted = set()
     try:
         for name, device in (("laser", laser), ("slm", slm)):
@@ -51,6 +66,15 @@ def _capture(slm, camera, laser, output_dir, gray_level, laser_settle_seconds, g
             device.connect()
             report["last_stage"] = f"connected_{name}"
         image = np.full(slm.image_shape, gray_level, dtype=np.uint8)
+        if rectangle is not None:
+            x, y = rectangle["x"], rectangle["y"]
+            right, bottom = x + rectangle["width"], y + rectangle["height"]
+            height, width = image.shape
+            if right > width or bottom > height:
+                raise ValueError(f"slm_active_rectangle is out of bounds for the {width} x {height} SLM image")
+            # The slice starts at the rectangle's first column. uint8 addition wraps at 256.
+            image[y:bottom, x:right:2] += np.uint8(128)
+            known_image.update(kind="alternating_column_stripes", stripe_mask_applied=True)
         np.save(output_dir / "slm-image.npy", image, allow_pickle=False)
         report["files"].append("slm-image.npy")
         drive = nullcontext()
@@ -164,7 +188,8 @@ def _load_settings(path):
     lcc_plan = LccAcquisitionPlan(**lcc_data) if lcc_data is not None else None
     if lcc_plan is not None and (generator is None or not generator.enabled):
         raise ValueError("An LCC acquisition plan requires an enabled generator")
-    return slm, camera, laser, gray, settle, generator, lcc_plan
+    rectangle = _validate_active_rectangle(data.get("slm_active_rectangle"))
+    return slm, camera, laser, gray, settle, generator, lcc_plan, rectangle
 
 
 def main(argv=None):
@@ -176,7 +201,7 @@ def main(argv=None):
     if not args.operator_approved:
         parser.error("A live capture requires --operator-approved after lab review")
     try:
-        slm_cfg, camera_cfg, laser_cfg, gray, settle, generator_cfg, lcc_plan = _load_settings(args.config)
+        slm_cfg, camera_cfg, laser_cfg, gray, settle, generator_cfg, lcc_plan, rectangle = _load_settings(args.config)
     except (ValueError, KeyError, TypeError, OSError) as exc:
         parser.error(str(exc))
     try:
@@ -184,7 +209,7 @@ def main(argv=None):
                               laser=LabLaser(laser_cfg), output_dir=args.output,
                               gray_level=gray, laser_settle_seconds=settle,
                               generator=RigolDG812(generator_cfg) if lcc_plan is not None else None,
-                              lcc_plan=lcc_plan)
+                              lcc_plan=lcc_plan, slm_active_rectangle=rectangle)
     except BenchBusyError as exc:
         parser.exit(1, f"{exc}\n")
     return 0 if report["capture_status"] == "completed" and report["cleanup_ok"] else 1

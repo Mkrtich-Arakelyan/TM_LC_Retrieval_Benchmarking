@@ -229,6 +229,72 @@ def test_single_capture_arms_before_flip_and_saves_exact_raw_frame(tmp_path, set
     saved = json.loads((tmp_path / "capture/capture-result.json").read_text())
     assert saved["frame"]["shape"] == [3, 4]
     assert set(saved["cleanup"]) == {"laser", "camera", "slm"}
+    assert saved["known_image"]["slm_active_rectangle"] is None
+    assert saved["known_image"]["stripe_mask_applied"] is False
+    np.testing.assert_array_equal(np.load(tmp_path / "capture/slm-image.npy"),
+                                  np.full((3, 4), 17, dtype=np.uint8))
+
+
+def test_cli_stripes_start_at_odd_rectangle_x_and_wrap_uint8(tmp_path, settings, monkeypatch):
+    import hardware.capture_once as capture_module
+
+    events = []
+    laser, _ = laser_for(settings, events)
+    displayed = []
+
+    class RecordingSlm(DeviceFake):
+        image_shape = (4, 6)
+
+        def display_image(self, image):
+            self._event("display")
+            displayed.append(image.copy())
+
+    monkeypatch.setattr(capture_module, "MeadowlarkSlm", lambda cfg: RecordingSlm("slm", events))
+    monkeypatch.setattr(capture_module, "CeleraCamera", lambda cfg: DeviceFake("camera", events))
+    monkeypatch.setattr(capture_module, "LabLaser", lambda cfg: laser)
+    template = Path(__file__).resolve().parents[1] / "configs/capture-once.example.json"
+    config = json.loads(template.read_text(encoding="utf-8"))
+    rectangle = {"x": 1, "y": 1, "width": 3, "height": 2}
+    config.update(gray_level=200, slm_active_rectangle=rectangle, camera_trigger_confirmed=True)
+    config["slm"]["return_codes"] = {"load_lut": 11, "write_image": 22, "image_complete": 33}
+    config["laser"]["startup_confirmed"] = True
+    path = tmp_path / "machine.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    output = tmp_path / "capture"
+    assert main(["--config", str(path), "--output", str(output), "--operator-approved"]) == 0
+
+    expected = np.array([[200, 200, 200, 200, 200, 200],
+                         [200, 72, 200, 72, 200, 200],
+                         [200, 72, 200, 72, 200, 200],
+                         [200, 200, 200, 200, 200, 200]], dtype=np.uint8)
+    assert len(displayed) == 1
+    assert displayed[0].dtype == np.uint8
+    np.testing.assert_array_equal(displayed[0], expected)
+    np.testing.assert_array_equal(np.load(output / "slm-image.npy"), displayed[0])
+    saved = json.loads((output / "capture-result.json").read_text(encoding="utf-8"))
+    assert saved["known_image"]["slm_active_rectangle"] == rectangle
+    assert saved["known_image"]["stripe_mask_applied"] is True
+
+
+@pytest.mark.parametrize("rectangle", [
+    {"x": 3, "y": 0, "width": 2, "height": 1},
+    {"x": 0, "y": 2, "width": 1, "height": 2},
+])
+def test_out_of_bounds_rectangle_fails_before_laser_emission(tmp_path, settings, rectangle):
+    events = []
+    laser, _ = laser_for(settings, events)
+    output = tmp_path / "capture"
+    report = capture_once(slm=DeviceFake("slm", events), camera=DeviceFake("camera", events),
+                          laser=laser, output_dir=output, gray_level=17, laser_settle_seconds=0,
+                          slm_active_rectangle=rectangle)
+    assert report["capture_status"] == "failed" and report["cleanup_ok"]
+    assert "slm_active_rectangle is out of bounds" in report["error"]
+    assert {"slm.connect", "slm.disconnect", "serial.close"}.issubset(events)
+    assert not {"L=1", "S=1", "slm.display", "camera.connect"}.intersection(events)
+    assert not (output / "slm-image.npy").exists()
+    saved = json.loads((output / "capture-result.json").read_text(encoding="utf-8"))
+    assert saved["known_image"]["slm_active_rectangle"] == rectangle
+    assert saved["known_image"]["stripe_mask_applied"] is False
 
 
 @pytest.mark.parametrize("slm_fail,camera_fail", [("display", None), (None, "capture"), (None, "connect")])

@@ -1,6 +1,7 @@
 {
   "camera_trigger_confirmed": false,
   "gray_level": 0,
+  "slm_active_rectangle": null,
   "laser_settle_seconds": 0,
   "slm": {
     "dll_path": "C:/REPLACE-WITH-VERIFIED-SDK/Blink_C_wrapper.dll",
