@@ -139,6 +139,25 @@ def local_recovery_assessment(payload, goal="complex_matrix"):
         "method_ambiguities": ["Intensity observations leave independent row phase unobserved; other ambiguities require discriminating evidence"], "follow_up": follow}
 
 
+def local_requested_methods(question):
+    """Intent selection for canned doubles only; live planning is model-owned."""
+    text = question.casefold()
+    comparison = ("compare" in text or "which method" in text) and ("ggs" in text or "gerchberg" in text) and (
+        "intensity_ls" in text or "intensity least squares" in text)
+    return ["ggs", "intensity_ls"] if comparison else ["ggs"]
+
+
+def local_comparison_text(metrics):
+    if "ggs.holdout_rmse" not in metrics or "intensity_ls.holdout_rmse" not in metrics:
+        return ""
+    result = "brightness tie" if metrics.get("comparison.brightness_tie") else (
+        "GGS has lower RMSE on this held-out set" if metrics["ggs.holdout_rmse"] < metrics["intensity_ls.holdout_rmse"] else
+        "nonlinear intensity_ls has lower RMSE on this held-out set")
+    return (f" GGS: RMSE={metrics['ggs.holdout_rmse']}, NMSE={metrics['ggs.holdout_nmse']}, fit time={metrics['ggs.runtime_seconds']}s; "
+            f"nonlinear intensity_ls: RMSE={metrics['intensity_ls.holdout_rmse']}, NMSE={metrics['intensity_ls.holdout_nmse']}, fit time={metrics['intensity_ls.runtime_seconds']}s. "
+            f"Result: {result} on identical held-out readings. One run does not establish statistical significance or unique matrix recovery; constant brightness can leave the TM unresolved.")
+
+
 class FixtureAnalystModel:
     """Canned metadata advice/review only; no numerical calculation."""
     def with_structured_output(self, schema):
@@ -194,6 +213,7 @@ class LocalScientist(LocalModel):
             reviews = [r for r in state["analyst_reviews"] if r.get("recovery")]
             recovery_note = (" Recovery assessment: " + json.dumps(reviews[-1]["recovery"]) +
                              " Limitations: " + "; ".join(reviews[-1]["limitations"])) if reviews else ""
+            recovery_note = local_comparison_text(metrics) + recovery_note
             return {"kind": "interpretation", "explanation": f"LOCAL TEST DOUBLE: held-out prediction {'passed' if passed else 'failed or is inconclusive'}; this is synthetic evidence, not laboratory validation.",
                 "recommended_next_step": "Inspect individual calibration and prediction artifacts",
                 "findings": [{"evidence_ids": [latest["id"]],
@@ -201,6 +221,7 @@ class LocalScientist(LocalModel):
                     "limitations": ["Local canned agent reasoning", "Uniform detector ROIs and ideal stable phase-only model", "Independent detector-row phase ambiguity"],
                     "recommended_next_step": "Review evidence before improving the physical model"}]}
         proposal = ExperimentProposal(scientific_question=state["user_request"],
+            retrieval_methods=local_requested_methods(state["user_request"]),
             hypothesis="A reference-free intensity fit can predict unseen phase-only detector readings",
             rationale="Candidate approaches: GGS amplitude replacement or intensity least squares; both require diverse known phases, not measured complex fields",
             variables={"approaches": "GGS or intensity least squares", "inputs": "Random phase-only SLM patterns"},
@@ -210,7 +231,7 @@ class LocalScientist(LocalModel):
             assumptions=["Synthetic model only", "Uniform coherent detector ROIs"],
             literature_references=[p["source_id"] for p in payload["literature_context"]])
         return {"kind": "proposal", "explanation": "LOCAL TEST DOUBLE: propose GGS and intensity least squares as intensity-only candidates.",
-                "recommended_next_step": "Experimentor selects the reference GGS acquisition/evaluation procedure",
+                "recommended_next_step": "Experimentor plans one matched acquisition for GGS and nonlinear intensity_ls" if len(local_requested_methods(state["user_request"])) == 2 else "Experimentor selects the reference GGS acquisition/evaluation procedure",
                 "proposals": [proposal.model_dump(mode="json")]}
 
 
@@ -224,7 +245,8 @@ class LocalExperimentor(LocalModel):
                 "recommended_next_step": "Inspect the saved calibration failure", "questions": ["Review model bounds and saved stopping reason before requesting another run."]}
         cfg = state["control"]["configuration"]["optical_bench"]
         proposal_id = state["control"]["active_proposal_ids"][0]
-        return {"kind": "procedure", "explanation": "LOCAL TEST DOUBLE: select reference-free GGS, acquire random phase-only patterns after calibration; no coherent reference or amplitude masking is used.",
+        return {"kind": "procedure", "explanation": ("LOCAL TEST DOUBLE: plan one shared acquisition for GGS and nonlinear intensity_ls; both will use the same fit/holdout patterns and eligible readings." if len(local_requested_methods(state["user_request"])) == 2 else
+                "LOCAL TEST DOUBLE: select reference-free GGS, acquire random phase-only patterns after calibration; no coherent reference or amplitude masking is used."),
             "recommended_next_step": "Runner preflight, then exact human review/approval", "procedure": {
                 "proposal_id": proposal_id, "version": payload["next_procedure_versions"][proposal_id],
                 "actions": [{"action": "bench.acquire", "instruction": "Calibrate fixed pattern to whole-frame 3–5% saturation, freeze settings, acquire fit and held-out phase patterns",
@@ -246,8 +268,9 @@ class LocalAnalyst(LocalModel):
             "proposal_ids": payload["proposal_ids"], "analysis_ids": payload["analysis_ids"],
             "evidence_ids": payload["proposal_ids"] if before else payload["analysis_ids"],
             "explanation": "LOCAL TEST DOUBLE: require separate holdout, clipped-fit exclusion and row-phase ambiguity." if before else
-                f"LOCAL TEST DOUBLE: measurement_passed={metrics.get('measurement_passed')}, prediction_passed={metrics.get('prediction_passed')}; inspect per-detector usable counts and held-out errors.",
-            "recommendations": ["Use bench.retrieve on saved raw frames; do not use hidden fields or truth" if before else "Keep workflow completion distinct from measurement and prediction quality"],
+                f"LOCAL TEST DOUBLE: measurement_passed={metrics.get('measurement_passed')}, prediction_passed={metrics.get('prediction_passed')}; inspect per-detector usable counts and held-out errors." + local_comparison_text(metrics),
+            "recommendations": [("Use tm.compare_reference_free for GGS versus nonlinear intensity_ls on one shared dataset; do not use hidden truth" if len(local_requested_methods(state["user_request"])) == 2 else
+                                  "Use bench.retrieve on saved raw frames; do not use hidden fields or truth") if before else "Keep workflow completion distinct from measurement and prediction quality"],
               "limitations": ["Local canned agent reasoning; synthetic model only"],
               "recovery": None if before else local_recovery_assessment(payload, getattr(self, "task_goal", "complex_matrix"))}
 
@@ -263,6 +286,9 @@ class LocalRouter(LocalModel):
             order = ["preflight", "interpret", "request_information"]
         else:
             order = ["conclude", "run_operation", "review_results", "plan_follow_up", "interpret", "advise", "preflight", "prepare_procedure", "propose", "request_information"]
+        if "run_operation" in order:
+            preferred = "tm.compare_reference_free" if len(local_requested_methods(context["research_question"])) == 2 else "bench.retrieve"
+            actions = sorted(actions, key=lambda a: a.get("request", {}).get("operation") != preferred)
         selected = next(a for kind in order for a in actions if a["kind"] == kind)
         return {"action_id": selected["id"], "record_ids": selected["record_ids"],
             "reason": "LOCAL TEST DOUBLE: " + (latest.get("explanation", "Stopped acquisition; inspect diagnostics") if selected["kind"] == "request_information" else selected["description"])}

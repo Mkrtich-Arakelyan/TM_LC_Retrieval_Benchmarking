@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import math
 import os
 import re
 from pathlib import Path
@@ -69,11 +70,17 @@ def export_workflow_view(view: dict, output_dir=None) -> Path:
     return root
 
 
+def bench_analyses(state):
+    return [a for a in state["analyses"] if a["method_settings"].get("operation") == "bench.retrieve" or
+            (a["method_settings"].get("operation") == "tm.compare_reference_free" and
+             any(Path(ref["path"]).name == "bench-evaluation.json" for ref in a["outputs"]))]
+
+
 def export_decisions(view, output_dir=None):
     state = view["state"]
     root = Path(output_dir or state["control"]["configuration"]["run_output_path"])
     root.mkdir(parents=True, exist_ok=True)
-    analyses = [a for a in state["analyses"] if a["method_settings"].get("operation") == "bench.retrieve"]
+    analyses = bench_analyses(state)
     metrics = analyses[-1]["metrics"] if analyses else {}
     failed = any(a["status"] in ("partial", "failed", "aborted") for a in state["acquisitions"])
     quality = {"workflow_status": view["status"], "workflow_completed": view["status"] == "completed",
@@ -186,13 +193,27 @@ def follow_up_support(state, follow):
     return "unavailable — " + "; ".join(missing) if missing else "supported by recorded capabilities; a new procedure still requires preflight and human approval"
 
 
+def coefficient_table(parts, detector_ids, title):
+    """Round-trip precision for each saved component; no phase alignment of tables."""
+    width = len(parts["real"][0])
+    lines = ["<details>", f"<summary>{title} — exact complex coefficients</summary>", "",
+             "Rows are camera detectors; columns are SLM inputs (1-based). Entries are real ± imaginary i, "
+             "shown with 17 significant digits so each binary64 component round-trips. Values are not phase-aligned.", "",
+             "| Camera detector / SLM input | " + " | ".join(f"Input {i+1}" for i in range(width)) + " |",
+             "| --- | " + " | ".join(["---"]*width) + " |"]
+    for detector, real, imag in zip(detector_ids, parts["real"], parts["imag"]):
+        values = [f"`{r:.17g} {'-' if math.copysign(1, i) < 0 else '+'} {abs(i):.17g}i`" for r, i in zip(real, imag)]
+        lines.append(f"| D{detector} | " + " | ".join(values) + " |")
+    return "\n".join([*lines, "", "</details>"])
+
+
 def export_run_summary(view, quality, output_dir=None):
     """Assemble recorded decisions and numerical exports; never call agents or refit."""
     state = view["state"]
     root = Path(output_dir or state["control"]["configuration"]["run_output_path"])
     root.mkdir(parents=True, exist_ok=True)
     acquisition = state["acquisitions"][-1] if state["acquisitions"] else None
-    analyses = [a for a in state["analyses"] if a["method_settings"].get("operation") == "bench.retrieve"]
+    analyses = bench_analyses(state)
     analysis = analyses[-1] if analyses else None
     raw_refs = acquisition["raw_data"] if acquisition else []
     outputs = analysis["outputs"] if analysis else []
@@ -255,15 +276,66 @@ def export_run_summary(view, quality, output_dir=None):
     lines.append("Conversation: " + _link(root, root / "conversation.md", "verbatim conversation") + ". Detailed trace: " +
                  _link(root, root / "agent-messages.md", "all recorded messages and validation details") + ".")
     lines.append("\n## Returned matrix and prediction baseline")
+    if evaluation and evaluation.get("methods"):
+        lines.append("**Matched algorithm comparison on one acquisition**. " + evaluation["comparison"]["selection"])
+        lines.extend(["| Method | Held-out RMSE | Held-out NMSE | Fit time (s) | Shared initialization (s) | Scored readings | Fit clipped | Held-out clipped | Mean-baseline RMSE |",
+                      "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"])
+        for name, result in evaluation["methods"].items():
+            numbers = result["metrics"]
+            keys = ("holdout_rmse", "holdout_nmse", "runtime_seconds", "shared_initialization_seconds", "holdout_scored_readings",
+                    "fit_clipped_readings", "holdout_clipped_readings", "mean_baseline.holdout_rmse")
+            values = [f"{numbers[key]:.9g}" if key in numbers else "not scored" for key in keys]
+            lines.append("| " + name + " | " + " | ".join(values) + " |")
+        lines.append("Brightness comparison: **" + evaluation["comparison"]["result"] + "**. " + evaluation["comparison"]["limitations"] +
+                     " " + evaluation["comparison"]["timing"])
+        for name in evaluation["methods"]:
+            refs = [ref for ref in outputs if Path(ref["path"]).parent.name == name and Path(ref["path"]).name in
+                    ("heldout-predictions.csv", "heldout-predictions.png", "heldout-example-grids.png", "heldout-detector-errors.csv")]
+            lines.append(name + " outputs: " + ", ".join(_link(root, ref["path"], Path(ref["path"]).name) for ref in refs))
     if len(estimates) > 1:
         lines.append("Several estimates were saved; no cross-estimate workflow selection is recorded. These are candidates.")
     for estimate in estimates:
         lines.append(f"{estimate['label']}: **{estimate['method']}**, analysis `{estimate['analysis_id']}`, shape {estimate['shape']} [detector, SLM input].")
+        source = estimate.get("truth_source")
+        if source:
+            lines.append("Simulator true TM source (saved configuration): " +
+                         (f"JSON `{Path(source['json_path']).name}` — `{source['json_path']}`." if source["json_path"] else
+                          f"Seeded random matrix, seed **{source['seed']}**.") +
+                         f" Recorded matrix fingerprint: `{source['matrix_fingerprint'] or 'not recorded'}`.")
         lines.append(", ".join(_link(root, estimate[key], label) for key, label in (
             ("estimate_path", "saved estimated TM NPZ"), ("heatmap", "magnitude heatmap"), ("coefficients_csv", "real/imaginary coefficient CSV"))))
         lines.append("Truth comparison: " + estimate["truth"] + (". " + estimate["truth_issue"] if "truth_issue" in estimate else
                      ". True and estimated magnitudes use the same axes and color scale; this is evaluation-only truth, never an agent/fitting input."))
-        baseline = estimate["baseline"]
+        comparison, baseline = estimate.get("matrix_comparison"), estimate["baseline"]
+        if baseline:
+            error = comparison["row_phase_aligned_relative_error"] if comparison else None
+            matrix_result = ((f"Aligned relative error **{error:.12g}**" if error is not None else "Relative error undefined (zero truth norm)") +
+                             f"; strongest inputs **{comparison['strongest_input_agreements']}/{comparison['total_rows']}** agree; "
+                             f"{len(comparison['ambiguous_rows'])} ambiguous rows") if comparison else "Comparison unavailable; see the recorded reason above"
+            lines.append("| Matrix vs verified simulator truth (human-only) | Held-out brightness prediction |\n"
+                         "| --- | --- |\n"
+                         f"| {matrix_result} | **{estimate['prediction_status']}**; fit RMSE **{baseline['fit_rmse']}**, NMSE **{baseline['fit_nmse']}**; "
+                         f"mean-baseline RMSE **{baseline['mean_baseline_rmse']}**, NMSE **{baseline['mean_baseline_nmse']}** — **{baseline['result']}** |")
+        if Path(estimate["heatmap"]).is_file():
+            lines.append("!" + _link(root, estimate["heatmap"], "True and estimated TM magnitudes" if "true_coefficients" in estimate else "Estimated TM magnitude"))
+        if comparison:
+            error = comparison["row_phase_aligned_relative_error"]
+            lines.append("**Comparison against simulator truth (human report only):** row-phase-aligned relative matrix error " +
+                         (f"**{error:.12g}**" if error is not None else "**undefined (true matrix has zero norm)**") +
+                         ". Defined as `||T_est,aligned - T_true||_F / ||T_true||_F`. " + comparison["alignment"] + ".")
+            lines.append(f"Strongest-input agreement: **{comparison['strongest_input_agreements']}/{comparison['total_rows']} detector rows**. "
+                         f"Ambiguous rows: {', '.join('D'+str(j) for j in comparison['ambiguous_rows']) or 'none'}. " + comparison["diagnostic_limit"] + ".")
+            mismatches = [row for row in comparison["strongest_inputs"] if row["status"] == "mismatch"]
+            lines.append("Strongest-input mismatches: " + ("; ".join(
+                f"D{row['detector']} (true input {row['true_inputs'][0]}, estimated input {row['estimated_inputs'][0]})" for row in mismatches) or "none") + ".")
+            ambiguities = [row for row in comparison["strongest_inputs"] if row["status"] == "ambiguous"]
+            if ambiguities:
+                lines.append("No arbitrary winner is selected for tied/near-tied or zero rows: " + "; ".join(
+                    f"D{row['detector']}: true candidates {row['true_inputs']}, estimated candidates {row['estimated_inputs']} (empty means no distinguished input)"
+                    for row in ambiguities) + ".")
+            lines.append(f"Strongest-input tie tolerance on magnitudes: rtol={comparison['tie_rtol']:g}, atol={comparison['tie_atol']:g}. "
+                         "This numerical truth comparison does not replace the separate recorded Analyst recovery assessment.")
+        lines.append("Held-out brightness prediction status (recorded): **" + estimate["prediction_status"] + "**.")
         if baseline:
             lines.append(f"Held-out fit RMSE **{baseline['fit_rmse']}**, fitting-mean baseline RMSE **{baseline['mean_baseline_rmse']}**; **{baseline['result']}**. "
                 f"NMSE: fit {baseline['fit_nmse']}, mean baseline {baseline['mean_baseline_nmse']}. "
@@ -272,6 +344,9 @@ def export_run_summary(view, quality, output_dir=None):
             lines.append(_link(root, estimate["baseline_csv"], "per-detector fit versus mean-baseline scores and counts"))
         else:
             lines.append("Mean-baseline comparison unavailable: " + estimate.get("baseline_issue", "No saved held-out predictions"))
+        if "true_coefficients" in estimate:
+            lines.append(coefficient_table(estimate["true_coefficients"], estimate["detector_ids"], "True TM (fingerprint verified)"))
+        lines.append(coefficient_table(estimate["estimated_coefficients"], estimate["detector_ids"], "Estimated TM (as saved)"))
     if not estimates:
         lines.append("No available saved matrix estimate; no matrix has been invented or fitted by this report.")
     lines.append("\n## Recorded decisions")

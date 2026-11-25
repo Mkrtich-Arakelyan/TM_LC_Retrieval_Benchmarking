@@ -39,7 +39,7 @@ def execute_operation(state: WorkflowState, request: AnalysisRequest, config: Ap
     # the primary audit copy bind its code_version to these support snapshots.
     from analysis import datasets, metrics, tm_analysis, tm_solvers
     implementations = [datasets, metrics, tm_analysis, tm_solvers]
-    if request.operation == "bench.retrieve":
+    if request.operation in ("bench.retrieve", "tm.compare_reference_free"):
         from analysis import bench_analysis
         from bench import config as bench_config, optical_bench, acquisition, plots, matrices, geometry
         implementations.extend([bench_analysis, bench_config, optical_bench, acquisition, plots, matrices, geometry])
@@ -60,7 +60,9 @@ def execute_operation(state: WorkflowState, request: AnalysisRequest, config: Ap
         return NumericalAnalysisResult(**common, execution=ExecutionDetails(status="unavailable",
             backend="reviewed_numpy", attempt_number=attempt_number, reason="Enable TM_REVIEWED_NUMERICS_ENABLED to run reviewed named operations; arbitrary code remains disabled"))
     try:
-        if request.operation == "bench.retrieve":
+        from analysis.bench_analysis import is_bench_manifest
+        bench_comparison = request.operation == "tm.compare_reference_free" and is_bench_manifest(artifacts[request.dataset_artifact_id], config)
+        if request.operation == "bench.retrieve" or bench_comparison:
             from analysis.bench_analysis import load_bench_dataset, retrieve
             if request.ground_truth_artifact_id is not None:
                 raise ValueError("Bench retrieval does not accept hidden ground-truth inputs")
@@ -74,7 +76,7 @@ def execute_operation(state: WorkflowState, request: AnalysisRequest, config: Ap
             audit_path = directory / "reviewed_bench_analysis.py"
             audit_path.write_bytes(Path(implementation.__file__).read_bytes())
             metrics, outputs = retrieve(manifest, data, request.parameters, directory,
-                                       deadline=started + config.numerical_timeout_seconds)
+                                       deadline=started + config.numerical_timeout_seconds, **({"compare": True} if bench_comparison else {}))
             outputs.append(Artifact(path=str(audit_path), description="Reviewed bench analysis audit copy", sha256=fingerprint(audit_path)))
             return NumericalAnalysisResult(**common, status="completed", metrics=validated_metrics(metrics), outputs=outputs,
                 execution=ExecutionDetails(status="completed", backend="reviewed_numpy", attempt_number=attempt_number,

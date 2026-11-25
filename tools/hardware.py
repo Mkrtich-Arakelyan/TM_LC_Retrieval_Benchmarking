@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from hardware.bench_access import bench_access, BenchBusyError, BenchCancellation, record_bench_run
 from workflow.config import AppConfig
 from workflow.state import (AcquisitionAction, AcquisitionResult, AcquisitionReview, ActionProgress,
                    Artifact, ExperimentProcedure, HardwareExecution, HumanApproval,
@@ -76,6 +78,8 @@ class HardwareBackend(Protocol):
     execute must enforce current limits atomically, honor the reviewed capability
     fingerprint, use only declared inputs/output_dir, and cooperate with deadlines
     and cancellation. A backend must not claim these guarantees unless verified.
+    Physical backends must check cancellation before device commands and use the
+    bench adapters' ownership and stop guards for laser and generator output.
     cleanup is backend-defined, not a universal safe device setting.
     """
     def describe(self) -> HardwareCapabilities: ...
@@ -296,6 +300,15 @@ def execute_acquisition(
     if issues:
         return HardwareRunResult(review=current, issues=issues)
     caps = HardwareCapabilities.model_validate(current.capabilities_snapshot)
+    access = bench_access(acquisition=True) if caps.data_origin == "physical" else nullcontext()
+    try:
+        with access:
+            return _run_acquisition(proc, approval, cfg, hardware, current, caps, attempt_id, cancel_event)
+    except BenchBusyError as exc:
+        return HardwareRunResult(review=current, issues=[str(exc)])
+
+
+def _run_acquisition(proc, approval, cfg, hardware, current, caps, attempt_id, cancel_event):
     attempt_id = attempt_id or uuid4()
     run_root = Path(current.configuration_snapshot["run_root"])
     run_root.mkdir(parents=True, exist_ok=True)
@@ -320,6 +333,9 @@ def execute_acquisition(
     record_path = directory / "record.json"
     _save_record(record_path, record)
     cancellation = cancel_event if cancel_event is not None else Event()
+    if caps.data_origin == "physical":
+        record_bench_run(directory)
+        cancellation = BenchCancellation(cancellation)
     run_deadline = time.monotonic() + cfg.hardware_run_timeout_seconds
     active = None
     aborted = False
@@ -341,6 +357,9 @@ def execute_acquisition(
             output.mkdir(parents=True, exist_ok=False)
             if not output.resolve().is_relative_to(directory):
                 raise ValueError("Raw-data destination escaped run directory")
+            if cancellation.is_set():
+                aborted = True
+                raise RuntimeError("Acquisition cancelled before dispatch; equipment stop must be confirmed")
             deadline = min(run_deadline, time.monotonic() + cfg.hardware_action_timeout_seconds)
             raw = hardware.execute(action.model_copy(deep=True), output_dir=output,
                 input_artifacts=[a.model_copy(deep=True) for a in
@@ -372,10 +391,12 @@ def execute_acquisition(
             active.status, active.ended_at = "completed", _utcnow()
             _save_record(record_path, record)
             active = None
+        if cancellation.is_set():
+            raise RuntimeError("Acquisition cancelled before completion. Equipment stop must be confirmed")
         record = AcquisitionResult.model_validate({**record.model_dump(), "status": "completed",
             "hardware": {**record.hardware.model_dump(), "ended_at": _utcnow()}})
     except (Exception, KeyboardInterrupt) as exc:
-        aborted = aborted or isinstance(exc, KeyboardInterrupt)
+        aborted = aborted or isinstance(exc, KeyboardInterrupt) or cancellation.is_set()
         reason = str(exc) or type(exc).__name__
         if active is not None:
             active.status = "aborted" if aborted else "failed"

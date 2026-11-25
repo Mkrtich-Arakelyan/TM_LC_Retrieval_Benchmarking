@@ -2,8 +2,14 @@
 
 import pytest
 
+from hardware import bench_access
 from workflow.config import AppConfig
 from workflow.state import AcquisitionResult, Artifact, ExperimentProposal, Setting, WorkflowState
+
+
+@pytest.fixture(autouse=True)
+def isolated_bench_control(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_access, "_LOCK_PATH", tmp_path / "bench.lock")
 
 
 @pytest.fixture

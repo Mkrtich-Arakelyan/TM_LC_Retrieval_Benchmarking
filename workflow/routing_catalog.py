@@ -210,11 +210,15 @@ def build_catalog(state: WorkflowState, config: AppConfig, services):
             dataset_id = UUID(dataset["dataset_artifact_id"])
             sources = [a for a in completed if any(ref.id == dataset_id for ref in a.input_data)]
             if dataset.get("kind") == "synthetic-bench-v1":
-                if not any(a.method_settings.get("operation") == "bench.retrieve" for a in sources):
-                    request = AnalysisRequest(calculation="Fit phase-only intensity measurements; evaluate held-out camera detector readings with clipping diagnostics",
-                        operation="bench.retrieve", input_record_ids=[UUID(dataset["input_record_id"])],
-                        dataset_artifact_id=dataset_id, parameters=TMFitSettings(iterations=800, restarts=4, seed=7))
-                    operation(request, "bench.retrieve: reference-free GGS, fit-only selection, held-out detector predictions, clipping flags and usable counts")
+                if not any(a.method_settings.get("operation") in ("bench.retrieve", "tm.compare_reference_free") for a in sources):
+                    requested = {name for proposal in active for name in proposal.retrieval_methods}
+                    operations = ("tm.compare_reference_free",) if requested == {"ggs", "intensity_ls"} else ("bench.retrieve",) if requested == {"ggs"} else ("bench.retrieve", "tm.compare_reference_free")
+                    for name in operations:
+                        request = AnalysisRequest(calculation="Compare GGS and nonlinear intensity least squares on identical training and held-out detector readings" if name == "tm.compare_reference_free" else "Fit GGS and evaluate held-out detector readings",
+                            operation=name, input_record_ids=[UUID(dataset["input_record_id"])], dataset_artifact_id=dataset_id,
+                            parameters=TMFitSettings(iterations=800, restarts=4, seed=7))
+                        operation(request, "tm.compare_reference_free: matched GGS versus nonlinear intensity_ls on this bench dataset, shared unclipped fit/holdout readings, training-only restart selection, timing and mean-brightness baseline" if name == "tm.compare_reference_free" else
+                            "bench.retrieve: GGS-only, fit-only selection, held-out detector predictions, clipping flags and usable counts")
                 continue
             for name in ("tm.validate_dataset", "tm.compare_reference_free"):
                 if any(a.method_settings.get("operation") == name for a in sources):

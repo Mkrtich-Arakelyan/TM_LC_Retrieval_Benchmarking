@@ -18,6 +18,22 @@ from tools.hardware import (ActionReport, ActionSpec, HardwareCapabilities,
 
 CAMERA_GAIN = 4000.0  # counts / (synthetic field intensity * seconds * mW)
 
+ACQUISITION_ARTIFACT_CONTRACT = {
+    "input_artifacts": [], "calibration_artifacts": {},
+    "ownership": "bench.acquire takes no external files. Matrix sources and hashes belong to private simulator configuration; calibration runs inside acquisition. Never copy source files into the input root or list them as data/calibration artifacts.",
+}
+
+
+def acquisition_artifact_errors(procedure):
+    """Shared planning/preflight contract for this fixed simulated acquisition."""
+    errors = [f"procedure.input_artifacts[{index}]: {artifact.path!r} is not an acquisition input; "
+              "bench.acquire accepts no external input artifacts. Private simulator configuration is backend-owned. Set input_artifacts=[]; do not move/copy files or widen input roots."
+              for index, artifact in enumerate(procedure.input_artifacts)]
+    errors.extend(f"procedure.calibration_artifacts[{name!r}]: bench.acquire calibrates during acquisition and accepts no external calibration artifacts. "
+                  "Private matrix sources are not calibration data. Set calibration_artifacts={}."
+                  for name in procedure.calibration_artifacts)
+    return errors
+
 
 def pattern_to_camera(matrix, inputs, *, shutter_seconds, laser_power_mw,
                       gain=CAMERA_GAIN, background=0.0, noise_std=0.0, rng=None):
@@ -128,14 +144,17 @@ class SimulatedBackend:
                 required_prerequisites=list(prerequisites))})
 
     def validate(self, procedure):
+        errors = ["Procedure validation error: " + error for error in acquisition_artifact_errors(procedure)]
         if len(procedure.actions) != 1 or procedure.actions[0].action != "bench.acquire":
-            return ["Reference bench procedure requires exactly one bench.acquire action"]
-        return []
+            errors.append("Reference bench procedure requires exactly one bench.acquire action")
+        return errors
 
     def cleanup(self, *, reason, deadline):
         return "Synthetic sequence stopped; no physical equipment was selected"
 
     def execute(self, action, *, output_dir, input_artifacts, capability_fingerprint, deadline, cancel_event):
+        if input_artifacts:
+            return ActionReport(errors=["bench.acquire accepts no external input/calibration artifacts; private simulator configuration is backend-owned"])
         cfg = self.config
         caps = self.describe()
         if capability_fingerprint != canonical_hash(caps.model_dump(mode="json")):

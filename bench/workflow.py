@@ -53,6 +53,9 @@ BENCH_QUESTION = (
 
 
 def setup_context(config):
+    public = config.model_dump()
+    for key in ("detector_matrix_path", "detector_matrix_sha256"):
+        public.pop(key, None)
     return """SYNTHETIC OPTICAL BENCH — workflow testing, not a physical instrument
 The supplied paper passages are context, not a claim to reproduce either apparatus.
 SLM controls are phases in radians with exactly equal input amplitudes. The hidden
@@ -72,10 +75,22 @@ The full raw camera frame is 20x20. Its centered 8x8 crop is [6:14,6:14], tiled 
 sixteen 2x2 speckle grains, ordered left to right, top to bottom, matching SLM order.
 Each grain has uniform coherent response in its four pixels. Extract
 the mean uint8 count; any 255 pixel marks that detector reading clipped. A reference
-procedure uses independently sampled random phases and reference-free GGS fitting.
-bench.retrieve fits only unclipped training readings per detector; it selects restarts
-by fit error alone and predicts independently held-out raw detector readings with
-the identical camera quantization and ROI extraction. It cannot determine each row's
+procedure uses independently sampled random phases. The user's initial task chooses
+the numerical operation, not this setup description. bench.retrieve is the GGS-only
+path. For a comparison of GGS and nonlinear intensity least squares (intensity_ls),
+use tm.compare_reference_free on this same synthetic-bench-v1 dataset. No second
+acquisition or generic dataset conversion is needed. Both methods use identical
+eligible training and held-out readings. GGS replaces predicted field amplitudes by
+sqrt(measured intensity), then refits the coefficients (the supplied HUANG-S2 excerpt).
+The implemented intensity_ls objective is mean((abs(X @ T.T)**2 - I)**2), optimized
+over complex coefficients using a real-coordinate complex gradient and backtracking.
+This description is an implementation contract, not an additional paper excerpt.
+These operations fit only unclipped training readings per detector; they select restarts
+by fit error alone and predict independently held-out raw detector readings with
+the identical camera quantization and ROI extraction. Each detector needs at least
+8*input_regions unclipped fitting readings and full complex input-pattern rank;
+held-out quality criteria require at least 8 usable readings per detector. This is
+fit eligibility, not proof of unique recovery. Neither operation can determine each row's
 global optical phase. The uniform-ROI assumption is essential for a rank-one TM;
 arbitrary mixtures of different pixel responses require a richer model later.
 No internal fields or true matrix are provided. Use the supplied model contract as
@@ -85,10 +100,16 @@ routing actions to obtain Analyst review and Scientist interpretation after retr
 Procedure prerequisites must select exact IDs from the supplied backend capability
 map. Keep explanatory text separate. Calibration is executed by bench.acquire and
 can fail; it is not a condition to certify before acquisition. Human approval is
-owned by the workflow after preflight. bench.retrieve is a separate reviewed numerical
-operation offered after an eligible dataset exists, not an acquisition action.
-Model configuration (synthetic values only):
-""" + json.dumps(config.model_dump(), indent=2)
+owned by the workflow after preflight. bench.retrieve and tm.compare_reference_free
+are reviewed numerical operations offered after an eligible dataset exists, not
+acquisition actions. For this comparison use one acquisition and one matched numerical
+comparison, then Analyst review and Scientist interpretation. Do not schedule follow-up
+experiments or cross-run reuse for a single comparison request.
+bench.acquire takes no external files: input_artifacts=[] and calibration_artifacts={}.
+Matrix JSON files and their hashes belong to private simulator configuration, not
+experiment input data; do not list, copy or move them as acquisition artifacts.
+Model configuration (public synthetic settings only):
+""" + json.dumps(public, indent=2) + "\nBackend-owned matrix mode: " + ("known" if config.detector_matrix_path else "seeded_random")
 
 
 def build_integrations(config):

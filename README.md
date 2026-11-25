@@ -1,19 +1,25 @@
-# TM retrieval benchmarking — persistent agent workflow
+# Transmission-matrix retrieval benchmarking
 
-Foundation for benchmarking transmission-matrix retrieval with an LC-SLM.
-The project provides typed records, configuration, an editable provisional optical
-setup, injected-model Scientist and Experimentor callables, a deterministic Runner,
-explicit orchestration, SQLite checkpoints, human review, and disabled-by-default
-numerical and hardware interfaces. Physical experiments
-are not available: there are no laboratory drivers or connected equipment.
+Benchmark intensity-only transmission-matrix (TM) retrieval for a phase-only LC-SLM.
+The project supports a synthetic optical bench, reviewed analysis of saved data, and
+an operator-approved one-frame laboratory capture. The agent workflow uses SQLite
+checkpoints and exact human approval before Runner acquisitions. Physical TM dataset
+acquisition still needs a lab-validated Runner backend.
 
-Use Python 3.10 or newer. From the project root:
+## Workflow setup
+
+Use Python 3.14.4, the tested version for the full workflow and test suite. From
+the project root in PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+The lab tools use the separate Python 3.9.19 environment below.
+
+## Simulation and saved-data analysis
 
 `workflow/state.py` defines records; `workflow/config.py` loads optional configuration;
 `configs/architecture.txt` describes the provisional setup outside future agent prompts.
@@ -29,19 +35,23 @@ with the synthetic setup context in `bench/workflow.py`. See
 and the standalone interference check. Simulation always requires explicit
 `--simulate`; it never selects physical hardware automatically.
 
-Simulation uses sixteen 2x2 speckle blocks tiling a centered 8x8 crop of the 20x20
-raw frame, with an 8x8 active phase-only SLM, sixteen inputs and a 16x16 TM.
+The default simulation uses sixteen 2x2 speckle blocks tiling a centered 8x8 crop
+of the 20x20 raw frame, with an 8x8 active phase-only SLM, sixteen inputs and a
+16x16 TM.
 It supports seeded random mixing or an exact 16x16 JSON
 matrix selected with `detector_matrix_path` in a bench config. See the
 [random, identity, and complex mixing commands](docs/optical-bench.md#random-or-supplied-detector-matrix)
 for live-agent starts, matrix format, source fingerprint checks, and phase-only
 identity-matrix ambiguity.
 
-Each bench run also writes `run-summary.md`, linking its recorded decisions,
-calibration attempts, separate raw/annotated camera images, representative
-held-out detector grids, and error/clipping counts across all held-out patterns.
-The summary is written even when calibration stops and keeps workflow completion,
-measurement quality, and prediction quality separate.
+The default bench retrieval uses generalized Gerchberg–Saxton (GGS). A matched
+comparison can fit GGS and intensity least squares on one acquisition and score
+both on the same eligible held-out readings alongside a mean-brightness baseline.
+Reports distinguish held-out brightness prediction from input-to-detector mapping
+and complex matrix recovery. The run summary links calibration attempts, raw and
+annotated images, held-out grids, and error and clipping counts. Exports also
+include `conversation.md` for saved handoffs, `agent-messages.md` for the detailed
+trace, and `workflow.json` for the structured record. [Optical bench guide](docs/optical-bench.md)
 
 Primary commands (PowerShell, from the project root):
 
@@ -59,10 +69,81 @@ agents. Saved-data reuse disables acquisition and retains a source bench's model
 mode, including local doubles. General `start "Question"`, `--fixture`, trusted
 `--factory`, and `follow-up` commands remain available.
 
+Regenerate a report from a saved workflow by supplying its actual `workflow.json`
+path and a separate output directory. Report regeneration uses saved records and
+files and needs no model or acquisition backend.
+
+```powershell
+.\.venv\Scripts\python.exe main.py report "outputs/bench/WORKFLOW_ID/workflow.json" --output outputs/bench-report
+```
+
+## Laboratory capture and shutdown check
+
+The lab path uses the Meadowlark PCIe SLM, ALKERIA Celera camera, Coherent Verdi V-5
+laser, and optional RIGOL DG812 for the liquid-crystal cell (LCC). The one-frame
+procedure saves the displayed SLM image, the raw Mono8 camera frame, and per-device
+cleanup results in `capture-result.json`. It runs separately from the agent workflow.
+Use the lab's Anaconda `myenv` environment with Python 3.9.19, the lab camera and SLM
+SDKs, and pySerial. The DG812 uses PyVISA 1.14.1 when enabled. [Capture and setup guide](docs/capture-once.md)
+
+Copy `configs/capture-once.example.json` to `config.local.json` and fill in the
+lab-confirmed SDK, LUT, serial and trigger settings before running an approved
+capture. The example disables the DG812, so the first capture opens no VISA
+session. An LCC capture requires an enabled generator and an explicit
+`lcc.amplitude_vpp` from 0.1 to 12 Vpp. CH1 uses a 20 kHz sine at 0 V DC offset, with
+load and phase preserved. The adapter records the requested settings, CH1 readback
+and shutdown confirmation. USB identification and CH1 readback have been checked
+on the lab PC. The LCC is currently disconnected from the optical setup, and live
+LCC preparation and shutdown still need bench verification.
+
+Run these from the repository root in Anaconda Prompt after reviewing the lab
+configuration. Use a fresh output directory for the capture.
+
+```bat
+conda activate myenv
+python -m hardware.capture_once --config config.local.json --output "C:\TM-lab-tests\one-frame-001" --operator-approved
+python check_shutdown.py --config config.local.json --run-dir "C:\TM-lab-tests\one-frame-001"
+```
+
+Run the second command after capture finishes. Use the exact capture output
+directory or physical Runner acquisition ID directory. The check queries the
+laser and the DG812 if it was used. Camera and SLM release are verified from
+per-device records without loading either SDK. A Runner record with only an
+aggregate cleanup result leaves both releases unverified. The four status lines
+show `PASS`, `FAIL`, `UNVERIFIED`, or `NOT USED`. A failure or unverified result
+returns exit code `1`. The shared bench lock blocks queries during an acquisition
+launched from this checkout.
+
+### Active shutdown from a second prompt
+
+From the repository root in a separate Anaconda Prompt:
+
+```bat
+conda activate myenv
+python shutdown_bench.py
+```
+
+The command reads `config.local.json`, requests cancellation, and blocks new
+physical acquisitions in this checkout. It waits up to three seconds for the
+owner to finish, then attempts the approved laser shutdown and turns off DG812
+CH1 when the generator is enabled in bench configuration. It verifies both
+outputs by readback. Camera and SLM statuses come from the owner's cleanup
+record. For an older run without automatic tracking, pass `--run-dir` with its
+output directory. `FAILED` and `UNVERIFIED` results return a nonzero exit code.
+
+The shutdown latch persists after the command exits. Once the operator has
+confirmed the bench is safe and is ready for another run, run
+`python shutdown_bench.py --rearm` to clear the latch without connecting to
+any device. If the PC, device, or owning process cannot be reached, follow
+the lab's manual physical shutdown procedure using its independent shutter and
+laser-disable controls. [Lab shutdown and cleanup notes](docs/capture-once.md#active-shutdown)
+
 ## Project layout
 
 ```text
 main.py                    Primary CLI
+check_shutdown.py          Read-only bench shutdown checker
+shutdown_bench.py          Active bench shutdown and explicit re-arm
 README.md, requirements.txt
 .env.example, .gitignore    Maintained root configuration
 .env                       Local credentials (ignored)
@@ -85,11 +166,17 @@ bench/
   workflow.py             Question, paper context, setup, integration factories
 analysis/
   bench_analysis.py        Bench retrieval and held-out evaluation
-    recovery.py              Truth-free measurement diagnostics for Analyst review
-    run_inspection.py        Human-only matrix and prediction-baseline report exports
+  recovery.py              Truth-free measurement diagnostics for Analyst review
+  run_inspection.py        Human-only matrix and prediction-baseline report exports
   datasets.py, metrics.py  Dataset validation/loading and numerical metrics
   tm_analysis.py           Saved-data TM operation implementation
   tm_solvers.py            Shared fitting and bounded archive loading
+hardware/
+  camera.py, slm.py        ALKERIA Celera and Meadowlark PCIe adapters
+  laser.py, generator.py  Coherent Verdi V-5 and RIGOL DG812 adapters
+  capture_once.py         Operator-approved one-frame procedure
+  bench_access.py         Ownership, cross-process cancellation and shutdown latch
+  run_records.py          Camera and SLM cleanup evidence from saved records
 fixtures/
   offline.py, hardware.py  Agent/execution doubles and recording backend
   numerical.py, router.py  Shared numerical fixtures and routing doubles
@@ -100,9 +187,13 @@ checks/
 configs/
   architecture.txt        Provisional general-workflow setup
   bench-*.json            Reusable synthetic starting conditions
+  capture-once.example.json  Lab settings template
 docs/
   optical-bench.md         Simulator, calibration, approval and artifact guide
-tests/, papers/           Tests and supplied literature
+  capture-once.md          Physical capture and shutdown-check guide
+  alkeria-camera.md, meadowlark-slm.md  Device setup and verification notes
+  papers/                  Local literature PDFs
+tests/                     Workflow, numerical and fake-device tests
 ```
 
 `tools/` contains the interfaces through which the workflow executes actions.
@@ -144,8 +235,9 @@ historical bench factory strings, without restoring old import modules.
   code and analyzes saved data into `NumericalAnalysisResult`. No direct hardware access.
 - Runner: enforces preflight and exact human approval, owns the hardware backend
   boundary, and records progress, actual settings, raw-data references, cleanup,
-  and failures. Provided backends include a test-only interface fixture and an
-  explicitly selected synthetic optical bench; laboratory backends own physical connections.
+  and failures. The repository supplies a test-only recording backend and an
+  explicitly selected synthetic optical bench. The operator-run lab capture owns
+  its physical connections through the device adapters.
 - Orchestrator: optionally uses a routing LLM for scientific next-step choices from
   a Python-owned action catalog. Preflight, human approval, execution, budgets and
   recovery remain Python responsibilities. Legacy and fixture runs retain deterministic routing.
@@ -310,16 +402,17 @@ named operation, interpretation, clarification, or accepting a recorded Scientis
 conclusion. No approval, direct acquisition, generated source, arbitrary function,
 module import or shell command is a routing action. Even a valid preflight selection
 only reaches Runner checks and human review. Only the existing exact-review human
-approval can reach acquisition, which Runner revalidates as before. The paper-context launcher keeps acquisition disabled.
+approval can reach acquisition, which Runner revalidates. Saved-data reuse keeps
+acquisition disabled.
 
 Each router turn is a LangGraph node with existing step limits. Chosen actions and
 record bindings are checkpointed before the executor node; numerical/acquisition
 attempt limits, durable execution receipts, no-blind-replay policy and approval
 fingerprints remain in force. Invalid/malformed choices are recorded as rejected,
 the workflow blocks with a clear error, and saved data/results remain intact. There
-is no automatic deterministic fallback after a bad router response. Correct the issue
-and use the existing launcher `--resume WORKFLOW_ID`; clarification, approval and
-reconciliation use their existing explicit commands.
+is no automatic deterministic fallback after a bad router response. Correct the
+issue and run `python main.py resume WORKFLOW_ID`, including `--simulate` when
+resuming a synthetic acquisition workflow.
 
 Decisions are stored in `WorkflowState.router_decisions` in SQLite and exported under
 the printed `outputs/runs/WORKFLOW_ID/` directory:
@@ -725,10 +818,12 @@ attempt directories conservatively. For numerical analysis of Runner outputs,
 configure `numerical_input_path` to the saved acquisition directory/root; keep it
 disjoint from the numerical analysis output root.
 
-## Future laboratory harness
+## Physical Runner integration
 
-Implement `HardwareBackend.describe`, `validate`, `execute`, and `cleanup` in a
-trusted adapter. `describe` supplies cached verified actions, parameter kinds,
+The one-frame capture uses the adapters in `hardware/` directly. Integrating
+physical TM acquisition into the Runner requires a trusted backend that implements
+`HardwareBackend.describe`, `validate`, `execute`, and `cleanup`. `describe` supplies
+cached verified actions, parameter kinds,
 units/limits, prerequisite evidence, calibration artifacts, and supported deadline,
 cancellation, and cleanup behavior. `validate` adds read-only checks and cannot
 waive deterministic validation. Neither operation may connect, discover, configure,
@@ -737,12 +832,11 @@ dedicated output directory, reviewed capability fingerprint, monotonic deadline,
 and cancellation event; it returns actual settings, artifacts, and errors through
 `ActionReport`. Return partial files on device errors and preserve raw measurements.
 
-No real drivers, physical cleanup procedure, multi-user authentication, or remote
-approval service is implemented. Local CLI approval and orchestration are available.
-Offline Runner tests use only temporary files and
-the recording fake. They verify approval gates, review changes, progress recording,
-partial failures, cancellation, cleanup, and recovery, not physical safety,
-calibration, timing guarantees, or scientific validity.
+Physical Runner acquisitions share the bench lock with the one-frame procedure
+and shutdown checker. Local Runner tests use temporary files and a recording fake
+to verify approval, record keeping, partial failures, cancellation, cleanup, and
+recovery. Lab calibration, acquisition timing, and equipment behavior still need
+verification on the connected setup.
 
 ## Persistent workflow and CLI
 
@@ -840,8 +934,8 @@ process invocation requiring integrations. That function configures external
 clients. Without explicit integrations or a factory, configured LLM settings select
 the built-in `workflow.llm:build_integrations` factory described below. Secrets can come from
 environment variables or in-memory `config.api_key` and are excluded from saved
-configuration. Normal numerical execution and physical hardware remain unavailable
-until their separately verified backends are implemented.
+configuration. Reviewed numerical operations run locally when enabled. Generated
+Python execution and physical TM acquisition require their own trusted backends.
 
 `WorkflowApp.start(...)` also accepts supplied literature, architecture path, and an
 initial `WorkflowState` containing saved records. `show`, `submit`, `resume`, `cancel`,
@@ -924,11 +1018,9 @@ not verify LLM scientific reasoning, script correctness, real execution isolatio
 or physical equipment. Current LangSmith transitively emits Python 3.14 deprecation
 warnings; no hosted tracing service is needed by these tests.
 
-## Next steps after review
+## Reviewed offline TM numerical operations
 
-### Reviewed offline TM numerical operations
-
-#### Shared CLI, paper context and backend integration
+### Shared CLI, paper context and backend integration
 
 `main.py` owns workflow command handling. `bench/workflow.py` retains the supplied `HUANG-S2`
 and `RAFAYELYAN-APP-A` excerpts, research questions, model setup and factory paths.
@@ -960,9 +1052,9 @@ The acquisition call path is `WorkflowApp` preflight/acquire nodes →
 the explicitly supplied backend. `agents.orchestrator` and the routing catalog
 choose workflow actions; they do not construct acquisition backends. Without an
 injected backend the shared hardware boundary uses `DisabledHardwareBackend`.
-The paper launcher keeps its literature passages and agent setup separate from
-this boundary. It starts new synthetic runs only with `--simulate`; saved-data
-reuse starts from completed saved acquisitions.
+`bench/workflow.py` keeps supplied literature passages and agent setup separate
+from this boundary. New synthetic runs start with `main.py start --simulate`.
+Saved-data reuse starts from completed acquisitions.
 
 One real saved-data path now implements `I = abs(X @ T.T)**2`, with input patterns
 as rows `X[N,D]`, camera output channels as columns `I[N,M]`, and `T[M,D]`. These
@@ -985,7 +1077,7 @@ fixture uses seed 123 for 130 general complex input vectors (3 input modes), 2
 output channels, 100 fit rows and 30 held-out rows. These vectors are mathematical
 test fields, not a verified phase-only LC-SLM command sequence or optical model.
 
-#### Dataset contract
+### Dataset contract
 
 A registered JSON manifest identifies a separately registered NPZ artifact:
 
@@ -1026,7 +1118,7 @@ Existing hardware provenance remains authoritative when supplied. Ground truth i
 an optional **separate** registered NPZ containing only complex finite `T[M,D]`.
 The fitting data archive rejects embedded ground truth.
 
-#### Named requests and workflow
+### Named requests and workflow
 
 `AnalysisRequest.operation` accepts `tm.validate_dataset`, `tm.compare_reference_free`,
 `tm.evaluate_saved_predictions`, or the synthetic bench's `bench.retrieve`.
@@ -1073,7 +1165,7 @@ Scientist interpretation. The Experimentor still owns acquisition/procedure desi
 descriptive legacy analysis requests retain their earlier route. No model is needed
 to dispatch the reviewed implementation itself.
 
-#### Exact solver variants and isolation of evaluation
+### Exact solver variants and isolation of evaluation
 
 Both methods use only `X_fit` and `I_fit`, normalized by the mean fit intensity.
 They share the same seeded random-phase least-squares initializations and number
@@ -1109,7 +1201,7 @@ assert exact matrix equality and identical fit trajectories under those changes.
 No method selection by holdout score is performed. Reusing these final holdout scores
 to tune future settings would invalidate their role as untouched final evaluation.
 
-#### Saved outputs and metrics
+### Saved outputs and metrics
 
 Each execution writes new artifacts under the workflow analysis directory:
 
@@ -1151,10 +1243,11 @@ without generating analysis code.
 Tests include a complex directional finite-difference gradient check, independent
 row-phase alignment, holdout/truth isolation, real workflow dispatch, malformed data,
 pairing/splits, nonfinite values, rank, hashes/IDs, provenance and disabled execution.
-Full optical realism, a physical adapter and a general-purpose sandbox remain
-outside these shared numerical operations; the small synthetic bench is documented separately.
+The synthetic bench supplies its own camera and optical model for simulated data.
+Reviewed numerical operations also accept eligible saved datasets with recorded
+provenance. [Synthetic bench guide](docs/optical-bench.md)
 
-### Optional Analyst handoffs
+## Optional Analyst handoffs
 
 `agents/analyst.py` uses the existing injected structured-output interface. Configure
 `Integrations(analyst_model=your_chat_model, ...)` to insert:
@@ -1209,25 +1302,15 @@ produces an unknown label and limitation. Metadata checks cannot prove every pro
 claim, validation independence, or scientific validity. Fixture reviews and tests
 verify software contracts, not reasoning quality or numerical correctness.
 
-The Analyst milestone identified the following numerical/data tooling needs. The
-reviewed numerical operations above now implement basic manifests, split checks,
-comparative metrics and saved outputs; the broader items remain future work:
+## Verification still needed
 
-- Dataset manifests with origin, hashes, calibration, preprocessing, units, shapes,
-  measurement budgets and train/validation/test membership.
-- Read-only saved-data/artifact inspection and input/output correspondence checks.
-- Validation split and leakage checks for genuinely independent held-out data.
-- Reproducible metrics, uncertainty estimates and phase-ambiguity-aware comparisons
-  tied to proposal evaluation criteria.
-- Provenance auditing and structured calculation execution through a verified isolated
-  backend, retaining scripts, parameters, seeds, logs and output artifacts.
+- Run the approved one-frame capture on the connected SLM and camera and verify
+  the trigger timing, raw frame, and recorded device cleanup.
+- Once the LCC is connected, verify CH1 preparation and shutdown readback on the
+  installed firmware and measure the waveform, voltage, and settling time at the cell.
+- Validate the physical TM acquisition sequence, calibration, and dataset records
+  before exposing it as a Runner backend.
 
-The small synthetic workflow bench is now available; richer physical simulation,
-data/preprocessing tools, uncertainty estimators and physical hardware remain future
-work. The reviewed numerical paths execute real local calculations.
-
-Confirm laboratory equipment, limits, calibration, and setup description. Later
-steps will add literature retrieval, a verified isolated numerical backend, and a
-verified laboratory harness. There is no RAG, PDF ingestion, embeddings, search,
-hardware driver, or laboratory scientific benchmark demonstration.
-Physical hardware behavior remains untested.
+Literature context comes from supplied passages. Automated PDF ingestion and
+retrieval, a verified isolated backend for generated Python, and uncertainty
+estimation for the benchmark remain future work.

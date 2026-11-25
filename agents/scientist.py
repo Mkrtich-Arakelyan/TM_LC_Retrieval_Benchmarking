@@ -15,6 +15,7 @@ from workflow.state import (
 from agents.common import ChatModel, DEFAULT_ARCHITECTURE_PATH, NO_LITERATURE_NOTICE, read_context
 from workflow.config import AppConfig
 from agents.common import HANDOFF_INSTRUCTIONS, handoff_context, save_handoff, validate_handoff
+from agents.common import planning_context, planning_state
 
 DEFAULT_SYSTEM_PROMPT = """You are the Scientist for LC-SLM transmission-matrix retrieval benchmarking.
 When llm_router_enabled is true, next-step and follow_up fields are recommendations;
@@ -43,6 +44,14 @@ validation data, noise, drift, and relevant phase ambiguities.
 
 Proposals must explain question/hypothesis, usefulness, variables and controls,
 required measurements, evaluation criteria, assumptions, and missing information.
+For the simulated bench set each proposal's retrieval_methods from the INITIAL USER
+TASK: ["ggs", "intensity_ls"] for a requested comparison, ["ggs"] for GGS-only.
+Setup defaults and example methods never override the user's task. Both methods
+can use one phase-only acquisition; compare them on the same saved fit/holdout data
+with tm.compare_reference_free. The implemented intensity_ls objective minimizes
+mean((abs(X @ T.T)**2 - I)**2); it does not measure complex fields. For a single
+comparison conclude from that run, with ties and unresolved matrix recovery explicit;
+do not expand into follow-up experiments, noise sweeps or cross-run reuse.
 Use questions for necessary missing information; choose request_information when
 it prevents a meaningful proposal or interpretation.
 Interpretations must distinguish measured evidence, numerical results, and
@@ -189,11 +198,11 @@ def scientist(
     The injected model must support LangChain's with_structured_output/invoke
     interface. No provider client or framework runtime is created here.
     """
-    context = read_context(architecture_path, literature_context)
+    context = planning_context(read_context(architecture_path, literature_context), state)
     snapshot = WorkflowState.model_validate(state.model_dump())
     passages = context.literature_context
     payload = {
-        "workflow_state": snapshot.model_dump(mode="json"),
+        "workflow_state": planning_state(snapshot),
         **context.model_dump(mode="json"),
         "literature_status": "Supplied passages only; no search performed." if passages else NO_LITERATURE_NOTICE,
         "allowed_source_ids": sorted({p.source_id for p in passages}),

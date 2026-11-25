@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import UUID
 
 import numpy as np
+from analysis.metrics import mean_baseline
 
 
 def checked_bytes(ref):
@@ -27,45 +28,12 @@ def load_estimate(ref):
     return matrix, prediction, eligible
 
 
-def mean_baseline(readings, fit_indices, held_indices, prediction, eligible, clipped=None):
-    """Use fit data only; compare predictors on one identical held-out mask."""
-    known_clipping = clipped is not None
-    clipped = np.zeros_like(readings, bool) if clipped is None else np.asarray(clipped, bool)
-    fit, held = readings[fit_indices], readings[held_indices]
-    fit_ok, held_ok = ~clipped[fit_indices], ~clipped[held_indices]
-    if prediction.shape != held.shape or np.shape(eligible) != (held.shape[1],):
-        raise ValueError("Saved predictions/eligibility do not match recorded detector readings")
-    means = np.array([np.mean(fit[fit_ok[:, j], j]) if fit_ok[:, j].any() else np.nan for j in range(held.shape[1])])
-    baseline = np.broadcast_to(means, held.shape)
-    common = held_ok & np.asarray(eligible, bool)[None, :] & np.isfinite(prediction) & np.isfinite(baseline)
-    def scores(mask):
-        if not mask.any():
-            return {"fit_rmse": None, "mean_baseline_rmse": None, "fit_nmse": None, "mean_baseline_nmse": None, "result": "not scored"}
-        squared = [(value[mask] - held[mask])**2 for value in (prediction, baseline)]
-        mse = [float(np.mean(value)) for value in squared]
-        denominator = max(float(np.mean(held[mask]**2)), 1e-12)
-        return {"fit_rmse": float(np.sqrt(mse[0])), "mean_baseline_rmse": float(np.sqrt(mse[1])),
-                "fit_nmse": mse[0]/denominator, "mean_baseline_nmse": mse[1]/denominator,
-                "result": "tie" if mse[0] == mse[1] else "fit better" if mse[0] < mse[1] else "mean baseline better"}
-    rows = []
-    for j in range(held.shape[1]):
-        mask = np.zeros_like(common)
-        mask[:, j] = common[:, j]
-        rows.append({"detector": j, "fitting_mean": float(means[j]) if np.isfinite(means[j]) else None,
-            "eligible_fit": int(fit_ok[:, j].sum()), "heldout_usable": int(mask.sum()),
-            "heldout_clipped": int((~held_ok[:, j]).sum()) if known_clipping else None, **scores(mask)})
-    return {**scores(common), "usable": int(common.sum()), "total": int(common.size),
-        "clipped": int((~held_ok).sum()) if known_clipping else None,
-        "unscorable_unclipped": int((held_ok & ~common).sum()) if known_clipping else None, "per_detector": rows,
-        "selection": "Per-detector mean of eligible fitting readings only; both predictors scored on the same eligible held-out readings. No refitting or holdout selection."
-            + (" Clipping flags were not recorded; eligibility uses the available saved data." if not known_clipping else "")}
-
 
 def _inputs(view, analysis):
     from workflow.state import WorkflowState
     from workflow.config import AppConfig
     from analysis.datasets import registered_artifacts, load_dataset
-    from analysis.bench_analysis import load_bench_dataset
+    from analysis.bench_analysis import is_bench_manifest, load_bench_dataset
     state = WorkflowState.model_validate(view["state"])
     config = AppConfig.model_validate(state.control.configuration)
     refs, _ = registered_artifacts(state, [UUID(analysis["id"])])
@@ -73,7 +41,7 @@ def _inputs(view, analysis):
         if Path(ref["path"]).suffix.lower() != ".json":
             continue
         reference = refs[UUID(ref["id"])]
-        if analysis["method_settings"].get("operation") == "bench.retrieve":
+        if is_bench_manifest(reference, config):
             manifest, data, _ = load_bench_dataset(reference, refs, config)
             split = manifest["fit_patterns"]
             return manifest, data["detector_readings"], np.arange(split), np.arange(split, len(data["phases"])), data["detector_saturation"] > 0
@@ -89,6 +57,36 @@ def verified_truth(manifest):
     from bench.optical_bench import OpticalBench
     bench = OpticalBench(BenchConfig.model_validate(manifest["config"]))
     return bench._evaluation_detector_rows(manifest.get("matrix_fingerprint"))
+
+
+def matrix_comparison(estimate, truth, detector_ids, *, rtol=1e-6, atol=1e-12):
+    """Human-only diagnostics; align row phase, never permute or rescale inputs."""
+    from analysis.metrics import aligned_matrix_errors
+    row_errors, absolute, relative = aligned_matrix_errors(estimate, truth)
+    def strongest(row):
+        magnitudes = np.abs(row)
+        maximum = float(magnitudes.max())
+        if maximum <= atol:
+            return []  # No distinguished input for a zero/numerically tiny row.
+        return (np.flatnonzero(np.isclose(magnitudes, maximum, rtol=rtol, atol=atol)) + 1).tolist()
+    rows = []
+    for detector, true_row, fitted_row in zip(detector_ids, truth, estimate):
+        expected, recovered = strongest(true_row), strongest(fitted_row)
+        ambiguous = len(expected) != 1 or len(recovered) != 1
+        rows.append({"detector": detector, "true_inputs": expected, "estimated_inputs": recovered,
+                     "status": "ambiguous" if ambiguous else "agree" if expected == recovered else "mismatch"})
+    return {"row_phase_aligned_relative_error": relative, "row_phase_aligned_absolute_error": absolute,
+            "row_phase_aligned_errors": row_errors.tolist(), "total_rows": len(rows),
+            "strongest_input_agreements": sum(row["status"] == "agree" for row in rows),
+            "strongest_input_mismatches": [row["detector"] for row in rows if row["status"] == "mismatch"],
+            "ambiguous_rows": [row["detector"] for row in rows if row["status"] == "ambiguous"],
+            "strongest_inputs": rows, "tie_rtol": rtol, "tie_atol": atol,
+            "alignment": "One unit-modulus global phase per detector row only; no amplitude rescaling or row/column permutation",
+            "diagnostic_limit": "Strongest-input agreement is a diagnostic, not a full test of matrix recovery"}
+
+
+def coefficient_parts(matrix):
+    return {"real": matrix.real.tolist(), "imag": matrix.imag.tolist()}
 
 
 def matrix_plot(estimate, truth, detector_ids, path):
@@ -122,6 +120,9 @@ def export_estimates(view, root):
                 "label": "Candidate" if len(candidates) > 1 else "Estimate",
                 "method": "GGS (bench.retrieve fixes this method before held-out evaluation)" if Path(ref["path"]).name == "estimated-tm.npz" else Path(ref["path"]).stem,
                 "shape": list(estimate.shape), "truth": "unavailable", "baseline": None}
+            method = Path(ref["path"]).stem
+            passed = analysis.get("metrics", {}).get(f"{method}.prediction_passed", analysis.get("metrics", {}).get("prediction_passed"))
+            result["prediction_status"] = "pass" if passed == 1 else "failed_or_inconclusive" if passed == 0 else "not recorded"
             manifest = None
             try:
                 manifest, readings, fit, held, clipped = _inputs(view, analysis)
@@ -139,6 +140,16 @@ def export_estimates(view, root):
                 truth = None
                 result["truth_issue"] = str(exc)
             ids = manifest.get("detector_order", list(range(len(estimate)))) if manifest else list(range(len(estimate)))
+            result["detector_ids"] = ids
+            result["estimated_coefficients"] = coefficient_parts(estimate)
+            result["truth_source"] = None
+            config = manifest["config"] if manifest else view["state"]["control"]["configuration"].get("optical_bench")
+            if config:
+                result["truth_source"] = {"json_path": config.get("detector_matrix_path"), "seed": config.get("seed"),
+                                          "matrix_fingerprint": manifest.get("matrix_fingerprint") if manifest else None}
+            if truth is not None:
+                result["true_coefficients"] = coefficient_parts(truth)
+                result["matrix_comparison"] = matrix_comparison(estimate, truth, ids)
             heatmap = directory / "matrix-magnitudes.png"
             matrix_plot(estimate, truth, ids, heatmap)
             coefficients = directory / "estimated-coefficients.csv"

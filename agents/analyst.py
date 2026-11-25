@@ -11,6 +11,7 @@ from agents.common import ChatModel, DEFAULT_ARCHITECTURE_PATH, NO_LITERATURE_NO
 from workflow.state import AnalystReview, ConversationEntry, LiteraturePassage, WorkflowState
 from workflow.config import AppConfig
 from agents.common import HANDOFF_INSTRUCTIONS, handoff_context, save_handoff, validate_handoff
+from agents.common import planning_context, planning_state
 
 DEFAULT_SYSTEM_PROMPT = """You are the Analyst for LC-SLM TM retrieval benchmarking.
 When llm_router_enabled is true, your review and analysis requests inform a separate
@@ -53,7 +54,21 @@ the calculation and its existing input_record_ids/input_artifact_paths. It may u
 For reviewed tools, set operation to tm.validate_dataset, tm.compare_reference_free,
 or tm.evaluate_saved_predictions (evaluate existing completed comparison outputs
 without refitting; input_record_ids must name the original comparison analysis).
-For a synthetic-bench-v1 dataset use bench.retrieve: reference-free GGS with
+For a synthetic-bench-v1 dataset use bench.retrieve for a GGS-only task, or
+tm.compare_reference_free for a requested GGS versus nonlinear intensity_ls
+comparison. Both accept the original bench.acquire manifest; no conversion needed.
+intensity_ls minimizes mean((abs(X @ T.T)**2 - I)**2) over complex coefficients,
+using a real-coordinate complex gradient and backtracking. GGS uses amplitude
+replacement and least-squares refitting as in the supplied HUANG-S2 passage.
+For the comparison review both prefixed metrics: held-out RMSE/NMSE, runtime_seconds,
+usable/clipped counts and mean-baseline errors. Both use the same eligible readings,
+seeded starts and fit-only restart/iterate selection. Explain the observed difference;
+a tiny difference in one run is not statistical significance. Explicitly report a
+brightness tie when comparison.brightness_tie is 1. Constant observations may allow
+both methods to match brightness while leaving the mapping and TM unresolved.
+Keep this single comparison run bounded: do not schedule follow-up experiments or
+cross-run reuse. Human-only truth comparisons are unavailable to you.
+The GGS-only path uses reference-free GGS with
 fit-only selection, clipped-fit exclusion, held-out camera predictions and usable
 counts. Its measurement_passed and prediction_passed are separate from workflow
 completion. The true TM and internal fields are unavailable to agents.
@@ -112,7 +127,7 @@ def analyst(state: WorkflowState, model: ChatModel, *,
             architecture_path: str | Path = DEFAULT_ARCHITECTURE_PATH,
             config: AppConfig | None = None, acquisition_capabilities: dict | None = None) -> AnalystResult:
     snapshot = WorkflowState.model_validate(state.model_dump())
-    context = read_context(architecture_path, literature_context)
+    context = planning_context(read_context(architecture_path, literature_context), state)
     proposals = proposal_ids if proposal_ids is not None else (
         snapshot.control.active_proposal_ids or [p.id for p in snapshot.proposals[-1:]])
     analyses = analysis_ids if analysis_ids is not None else (
@@ -130,7 +145,7 @@ def analyst(state: WorkflowState, model: ChatModel, *,
                                             for origin in provenance.get(str(key), ["unknown"])})
         if result.data_origin:
             provenance[str(result.id)] = sorted((set(provenance[str(result.id)]) - {"unknown"}) | {result.data_origin})
-    payload = {"workflow_state": snapshot.model_dump(mode="json"), **context.model_dump(mode="json"),
+    payload = {"workflow_state": planning_state(snapshot), **context.model_dump(mode="json"),
                "handoffs": handoff_context(snapshot, "analyst"),
                "handoff_required": bool(snapshot.control.configuration),
                "stage": stage, "proposal_ids": list(map(str, proposals)), "analysis_ids": list(map(str, analyses)),

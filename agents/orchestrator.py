@@ -16,8 +16,13 @@ do not treat arbitrary complex inputs as phase-only data. If required evidence c
 be computed with an available reviewed operation, select it. For a matched comparison,
 dataset inventory entries marked validated have already passed Python's checks;
 prefer the comparison operation over redundant validation-only work.
-For synthetic-bench-v1 data, bench.retrieve is the reviewed saved-data operation;
-after its results, obtain Analyst review and Scientist interpretation before concluding.
+For synthetic-bench-v1 data, bench.retrieve is the GGS-only reviewed operation.
+For a user-requested comparison of GGS and nonlinear intensity least squares,
+select tm.compare_reference_free on that same bench dataset. The Scientist's
+retrieval_methods expresses the task; the default GGS example never overrides a
+comparison request. Use one acquisition and one matched comparison; do not run
+bench.retrieve first or repeat methods as separate operations. Both operations
+require Analyst review and Scientist interpretation after their results before concluding.
 Use the Analyst's structured recovery assessment: accurate predictions do not prove
 mapping or complex recovery. Prefer an offered plan_follow_up for a discriminating
 measurement when recovery is required. It requests Experimentor planning, never

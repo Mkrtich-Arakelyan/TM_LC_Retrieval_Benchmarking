@@ -39,7 +39,7 @@ def review_evidence(state, analysis_ids, config):
     """Use registered acquisition inputs only. Never load T/ground-truth archives."""
     from pathlib import Path
     from analysis.datasets import registered_artifacts, load_dataset
-    from analysis.bench_analysis import load_bench_dataset
+    from analysis.bench_analysis import is_bench_manifest, load_bench_dataset
 
     results = []
     for analysis in state.analyses:
@@ -56,7 +56,7 @@ def review_evidence(state, analysis_ids, config):
                 if Path(ref.path).suffix.lower() != ".json":
                     continue
                 try:
-                    if analysis.method_settings.get("operation") == "bench.retrieve":
+                    if is_bench_manifest(ref, config):
                         manifest, data, _ = load_bench_dataset(ref, refs, config)
                         regions = manifest["regions"]
                         noise = [manifest["read_noise_std"] / np.sqrt((r[1]-r[0])*(r[3]-r[2])) for r in regions]

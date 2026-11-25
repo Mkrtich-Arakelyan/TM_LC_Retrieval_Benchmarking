@@ -13,9 +13,20 @@ from bench.geometry import recorded_regions
 from bench.acquisition import extract_detectors, saved_artifact, write_json
 from tools.python_execution import checked_inputs
 from analysis.tm_solvers import _archive, fit_methods
+from analysis.metrics import mean_baseline
 
 BENCH_ARRAYS = {"phases", "frames", "pattern_ids", "detector_readings",
                 "detector_saturation", "whole_frame_saturation"}
+
+
+def is_bench_manifest(reference, config):
+    if reference.sha256 is None:
+        raise ValueError("Dataset manifest requires a recorded content hash")
+    checked = checked_inputs([reference], config)[0]
+    if Path(checked.path).stat().st_size > 1024 * 1024:
+        raise ValueError("Dataset manifest exceeds size budget")
+    payload = json.loads(Path(checked.path).read_text(encoding="utf-8"))
+    return isinstance(payload, dict) and payload.get("kind") == "synthetic-bench-v1"
 
 
 def inspection_outputs(manifest, data, predicted, predicted_sat, identifiable, directory):
@@ -129,8 +140,8 @@ def load_bench_dataset(reference, artifacts, config):
     return manifest, data, arrays_ref
 
 
-def retrieve(manifest, data, settings, directory, *, deadline):
-    """GGS is selected in advance, never using holdout scores or hidden truth.
+def retrieve(manifest, data, settings, directory, *, deadline, compare=False):
+    """GGS-only or matched comparison; never select using holdout or hidden truth.
 
     The legacy `identifiable` mask checks only fit eligibility (count and input
     rank), not unique recovery. Intensity-only patterns can retain mapping and
@@ -138,7 +149,6 @@ def retrieve(manifest, data, settings, directory, *, deadline):
     performed. Clipped fit readings are excluded per detector, not treated as 255
     linear observations. Predictions include the same quantization and ROI mean.
     """
-    from bench.plots import prediction_plot
     cfg = BenchConfig.model_validate(manifest["config"])
     regions = recorded_regions(manifest, cfg.frame_side)
     detector_count = len(regions)
@@ -146,10 +156,11 @@ def retrieve(manifest, data, settings, directory, *, deadline):
     X = np.exp(1j * data["phases"])
     measured = data["detector_readings"]
     clipped = data["detector_saturation"] > 0
-    estimates = np.zeros((detector_count, cfg.input_regions), dtype=complex)
+    names = ("ggs", "intensity_ls") if compare else ("ggs",)
+    estimates = {name: np.zeros((detector_count, cfg.input_regions), dtype=complex) for name in names}
     identifiable = []
     fit_usable = []
-    details = []
+    details = {name: [] for name in names}
     for j in range(detector_count):
         mask = ~clipped[:fit_count, j]
         usable = int(mask.sum())
@@ -160,11 +171,60 @@ def retrieve(manifest, data, settings, directory, *, deadline):
             # Known synthetic camera offset is removed before intensity fitting.
             intensity = np.maximum(measured[:fit_count, j:j+1][mask] - manifest["background_counts"], 0)
             methods = fit_methods(X[:fit_count][mask], intensity, settings, deadline=deadline)
-            selected = methods["ggs"]  # reference method fixed before observing holdout
-            estimates[j] = selected["T"][0]
-            details.append({k: v for k, v in selected.items() if k != "T"})
+            for name in names:
+                selected = methods[name]  # Both share this exact fit-only call and mask.
+                estimates[name][j] = selected["T"][0]
+                details[name].append({k: v for k, v in selected.items() if k != "T"})
         else:
-            details.append({"failure": "Insufficient unclipped independent fit measurements"})
+            for name in names:
+                details[name].append({"failure": "Insufficient unclipped independent fit measurements"})
+    if not compare:
+        return _evaluate_fit(manifest, data, directory, estimates["ggs"], identifiable, fit_usable, details["ggs"], deadline=deadline)
+    per_method, outputs, reports = {}, [], {}
+    for name in names:
+        method_dir = directory / name
+        method_dir.mkdir()
+        metrics, refs = _evaluate_fit(manifest, data, method_dir, estimates[name], identifiable, fit_usable, details[name],
+            deadline=deadline, method=name, matrix_name=name + ".npz")
+        per_method[name] = metrics
+        reports[name] = json.loads((method_dir / "bench-evaluation.json").read_text(encoding="utf-8"))
+        outputs.extend(refs)
+    common_keys = ("fit_pattern_count", "holdout_pattern_count", "fit_usable_readings", "fit_clipped_readings",
+                   "holdout_usable_readings", "holdout_clipped_readings", "holdout_scored_readings", "measurement_passed")
+    metrics = {key: per_method["ggs"][key] for key in common_keys}
+    metrics.update({f"{name}.{key}": value for name, result in per_method.items() for key, value in result.items()})
+    metrics["prediction_passed"] = int(all(per_method[name]["prediction_passed"] for name in names))
+    metrics["shared_eligible_masks"] = 1
+    for key in ("mean_baseline.holdout_rmse", "mean_baseline.holdout_nmse", "shared_initialization_seconds"):
+        if key in per_method["ggs"]:
+            metrics[key] = per_method["ggs"][key]
+    if "holdout_rmse" in per_method["ggs"]:
+        first, second = (per_method[name]["holdout_rmse"] for name in names)
+        metrics["intensity_ls_minus_ggs.holdout_rmse"] = second - first
+        metrics["intensity_ls_minus_ggs.holdout_nmse"] = per_method["intensity_ls"]["holdout_nmse"] - per_method["ggs"]["holdout_nmse"]
+        metrics["comparison.brightness_tie"] = int(np.isclose(first, second, rtol=1e-9, atol=1e-12))
+    report = {"method": "Matched GGS versus nonlinear intensity least squares; no method selected using held-out results",
+        "methods": reports, "metrics": metrics, "data_origin": "simulated",
+        "measurement_variation": reports["ggs"]["measurement_variation"],
+        "comparison": {"selection": "Identical fit/holdout patterns and per-detector eligibility masks. Shared seeded starts; best restart/iterate selected by training intensity MSE only.",
+            "result": "tie" if metrics.get("comparison.brightness_tie") else
+                ("ggs has lower RMSE on this held-out set" if metrics["intensity_ls_minus_ggs.holdout_rmse"] > 0 else "intensity_ls has lower RMSE on this held-out set")
+                if "comparison.brightness_tie" in metrics else "inconclusive",
+            "limitations": "One dataset/run, not a significance test. Low prediction error is not unique TM recovery. Truth is unavailable to fitting and agents.",
+            "timing": "Per-method runtime excludes shared initialization, which is reported separately; plotting/export time excluded."}}
+    write_json(directory / "bench-evaluation.json", report)
+    outputs.append(saved_artifact(directory / "bench-evaluation.json", "Matched benchmark of GGS and nonlinear intensity least squares"))
+    return metrics, outputs
+
+
+def _evaluate_fit(manifest, data, directory, estimates, identifiable, fit_usable, details, *, deadline,
+                  method="ggs", matrix_name="estimated-tm.npz"):
+    from bench.plots import prediction_plot
+    cfg = BenchConfig.model_validate(manifest["config"])
+    regions = recorded_regions(manifest, cfg.frame_side)
+    detector_count, fit_count = len(regions), cfg.fit_patterns
+    X, measured = np.exp(1j * data["phases"]), data["detector_readings"]
+    clipped = data["detector_saturation"] > 0
     scale = manifest["camera_gain"] * manifest["shutter_seconds"] * manifest["laser_power_mw"]
     predicted_matrix = np.zeros((cfg.frame_side, cfg.frame_side, cfg.input_regions), dtype=complex)
     for j, (y0, y1, x0, x1) in enumerate(regions):
@@ -196,6 +256,15 @@ def retrieve(manifest, data, settings, directory, *, deadline):
             passed = False
     metrics["prediction_passed"] = int(passed)
     metrics["measurement_passed"] = int(all(identifiable) and all((~hold_clipped).sum(axis=0) >= 8))
+    baseline = mean_baseline(measured, np.arange(fit_count), np.arange(fit_count, len(measured)), predicted, identifiable, clipped)
+    metrics["holdout_scored_readings"] = baseline["usable"]
+    for key, value in baseline.items():
+        target = {"fit_rmse": "holdout_rmse", "fit_nmse": "holdout_nmse",
+                  "mean_baseline_rmse": "mean_baseline.holdout_rmse", "mean_baseline_nmse": "mean_baseline.holdout_nmse"}.get(key)
+        if target and value is not None:
+            metrics[target] = value
+    metrics["runtime_seconds"] = sum(detail.get("runtime_seconds", 0.) for detail in details)
+    metrics["shared_initialization_seconds"] = sum(detail.get("shared_initialization_seconds", 0.) for detail in details)
     rows = []
     for i, pattern_id in enumerate(data["pattern_ids"][fit_count:]):
         for j in range(detector_count):
@@ -210,10 +279,10 @@ def retrieve(manifest, data, settings, directory, *, deadline):
         writer.writeheader()
         writer.writerows(rows)
     prediction_plot(hold_measured, predicted, hold_clipped, directory / "heldout-predictions.png")
-    np.savez(directory / "estimated-tm.npz", T=estimates / np.sqrt(scale),
+    np.savez(directory / matrix_name, T=estimates / np.sqrt(scale),
              identifiable=np.asarray(identifiable), fit_eligible=np.asarray(identifiable), holdout_prediction=predicted)
     inspection, inspection_files = inspection_outputs(manifest, data, predicted, predicted_sat, identifiable, directory)
-    report = {"method": "GGS with fit-only restart selection; intensity LS also calculated by shared fitter but not selected",
+    report = {"method": "GGS with fit-only restart selection; intensity LS also calculated by shared fitter but not selected" if matrix_name == "estimated-tm.npz" else method + " with fit-only restart selection",
         **inspection,
         "regions": regions, "camera_crop": manifest.get("camera_crop"),
         "detector_order": manifest.get("detector_order", list(range(detector_count))),
@@ -225,12 +294,12 @@ def retrieve(manifest, data, settings, directory, *, deadline):
         "ambiguity": "Independent global phase per detector row; other mapping/amplitude ambiguities may remain. True TM and internal fields never used for fitting/evaluation",
         "limitations": ["Uniform coherent response in each ROI", "Known synthetic offset subtracted", "Clipped holdout excluded from scores but retained in CSV", "No laboratory realism established"],
         "settings": {k: manifest[k] for k in ("shutter_seconds", "laser_power_mw", "background_counts", "read_noise_std")},
-        "fitting": details}
+        "fitting": details, "mean_baseline": baseline}
     write_json(directory / "bench-evaluation.json", report)
     outputs = [saved_artifact(directory / name, description) for name, description in [
         ("heldout-predictions.csv", "Per-pattern/per-detector held-out readings, errors and clipping flags"),
         ("heldout-predictions.png", "Measured versus predicted held-out detector counts"),
-        ("estimated-tm.npz", "Estimated matrix only, arbitrary independent row phases; no hidden truth"),
+        (matrix_name, "Estimated matrix only, arbitrary independent row phases; no hidden truth"),
         ("bench-evaluation.json", "Separate measurement and prediction quality with usable measurement counts")]]
     outputs.extend(saved_artifact(directory / name, "Recorded held-out inspection: " + name) for name in inspection_files)
     if time.monotonic() > deadline:

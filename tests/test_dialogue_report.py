@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 import main
-from analysis.run_inspection import mean_baseline, verified_truth
+from analysis.run_inspection import matrix_comparison, mean_baseline, verified_truth
 from bench.config import BenchConfig
 from bench.matrices import pin_detector_matrix
 from bench.optical_bench import OpticalBench
@@ -166,6 +166,10 @@ def test_varying_data_no_truth_and_candidate_labels(tmp_path, candidates, monkey
     summary = (root / "run-summary.md").read_text(encoding="utf-8")
     assert "Matrix recovery: **not assessed**" in summary
     assert "Truth comparison: unavailable" in summary
+    assert "<summary>Estimated TM (as saved)" in summary
+    assert "<summary>True TM" not in summary
+    assert "row-phase-aligned relative matrix error" not in summary
+    assert_embedded_images(root, summary)
 
 
 def test_stopped_report_has_last_stage_and_recorded_reason(tmp_path):
@@ -179,3 +183,107 @@ def test_stopped_report_has_last_stage_and_recorded_reason(tmp_path):
     assert "Workflow: **stopped**" in text and view["reason"] in text
     assert "Runner preflight/review recorded; no acquisition executed" in text
     assert "No available saved matrix estimate" in text
+
+
+def assert_embedded_images(root, summary):
+    import re
+    from urllib.parse import unquote, urlparse
+    from PIL import Image
+    paths = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", summary)
+    assert paths
+    for path in paths:
+        assert not urlparse(path).scheme and not Path(unquote(path)).is_absolute()
+        with Image.open(root / unquote(path)) as image:
+            image.verify()  # Resolve/decode the same relative URL a Markdown viewer uses.
+
+
+def identity_report_view(tmp_path, estimate):
+    """A registered identity measurement fixture; report inputs contain no truth T."""
+    from test_recovery import varying_case
+    from bench.geometry import geometry_metadata
+    from tools.python_execution import fingerprint
+    from workflow.state import Artifact
+    _, _, cfg, _, state, _ = varying_case(tmp_path)
+    config = pin_detector_matrix(BenchConfig(fit_patterns=128, holdout_patterns=8,
+        detector_matrix_path=str(Path(__file__).resolve().parents[1] / "configs/matrices/identity-16x16.json")))
+    geometry = geometry_metadata()
+    phases = np.random.default_rng(9).uniform(-np.pi, np.pi, (136, 16))
+    frames = np.zeros((136, 20, 20), dtype=np.uint8)
+    for y0, y1, x0, x1 in geometry["regions"]:
+        frames[:, y0:y1, x0:x1] = 40
+    path = cfg.numerical_input_path / "identity-measurements.npz"
+    ids = [f"fit-{i:04}" for i in range(128)] + [f"holdout-{i:04}" for i in range(8)]
+    np.savez(path, phases=phases, frames=frames, pattern_ids=np.array(ids),
+        detector_readings=np.full((136, 16), 40.), detector_saturation=np.zeros((136, 16)),
+        whole_frame_saturation=np.zeros(136))
+    arrays = Artifact(path=str(path), description="Saved measured identity frames", sha256=fingerprint(path))
+    manifest = {"kind": "synthetic-bench-v1", "data_origin": "simulated", **OpticalBench(config).metadata,
+        "config": config.model_dump(), "arrays": arrays.model_dump(mode="json"),
+        "fit_patterns": 128, "holdout_patterns": 8, "shutter_seconds": .01, "laser_power_mw": 1.,
+        "background_counts": 0., "read_noise_std": 0., "camera_gain": 4000.}
+    path = cfg.numerical_input_path / "identity-dataset.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    recorded = Artifact(path=str(path), description="Saved identity manifest", sha256=fingerprint(path))
+    state.acquisitions[0].raw_data = [recorded, arrays]
+    state.acquisitions[0].data_origin = "simulated"
+    analysis = state.analyses[0]
+    analysis.input_data = [recorded, arrays]
+    analysis.method_settings = {"operation": "bench.retrieve"}
+    analysis.metrics = {"prediction_passed": 1, "measurement_passed": 1}
+    path = tmp_path / "estimated-tm.npz"
+    np.savez(path, T=estimate, holdout_prediction=np.full((8, 16), 40.), fit_eligible=np.ones(16, bool))
+    analysis.outputs = [Artifact(path=str(path), description="Saved estimate", sha256=fingerprint(path))]
+    state.control.configuration = cfg.model_dump(mode="json")
+    return {"workflow_id": str(state.id), "status": "completed", "pending": None, "reason": None,
+            "state": state.model_dump(mode="json")}
+
+
+@pytest.mark.parametrize("phase_equivalent", [False, True])
+def test_identity_truth_comparison_embedded_next_to_zero_prediction_error(tmp_path, phase_equivalent):
+    if phase_equivalent:
+        estimate = np.eye(16, dtype=complex) * np.exp(1j*np.linspace(-2., 2., 16))[:, None]
+    else:
+        estimate = np.zeros((16, 16), complex)
+        estimate[:, 5] = 1  # Every detector assigned to input 6.
+    view = identity_report_view(tmp_path, estimate)
+    original = json.dumps(view, sort_keys=True)
+    source = tmp_path / "saved-view.json"
+    source.write_text(json.dumps(view), encoding="utf-8")
+    root = regenerate_report(source, tmp_path / "regenerated")
+    text = (root / "run-summary.md").read_text(encoding="utf-8")
+    result = json.loads((root / "matrix-inspection.json").read_text())["estimates"][0]
+    comparison = result["matrix_comparison"]
+    assert comparison["strongest_input_agreements"] == (16 if phase_equivalent else 1)
+    assert comparison["ambiguous_rows"] == []
+    if phase_equivalent:
+        assert comparison["row_phase_aligned_relative_error"] < 1e-14
+        np.testing.assert_array_equal(result["estimated_coefficients"]["imag"], estimate.imag)
+    else:
+        assert comparison["row_phase_aligned_relative_error"] == pytest.approx(np.sqrt(30)/4)
+        assert comparison["strongest_input_mismatches"] == [j for j in range(16) if j != 5]
+        assert "**1/16 detector rows**" in text
+        assert "D0 (true input 1, estimated input 6)" in text
+    assert "Held-out brightness prediction status (recorded): **pass**" in text
+    assert "| Matrix vs verified simulator truth (human-only) | Held-out brightness prediction |" in text
+    assert "Held-out fit RMSE **0.0**, fitting-mean baseline RMSE **0.0**; **tie**" in text
+    assert "identity-16x16.json" in text
+    assert "<summary>True TM (fingerprint verified)" in text and "<summary>Estimated TM (as saved)" in text
+    assert "| Camera detector / SLM input | Input 1 |" in text
+    assert "separate recorded Analyst recovery assessment" in text
+    assert "Matrix recovery: **not assessed**" in text  # Truth diagnostics don't invent an agent conclusion.
+    assert_embedded_images(root, text)
+    assert json.dumps(view, sort_keys=True) == original
+    assert "true_coefficients" not in source.read_text()  # Human export only.
+
+
+def test_strongest_input_ties_near_ties_and_zero_rows_are_ambiguous():
+    truth = np.eye(3, dtype=complex)
+    estimate = np.array([[1., 1.-5e-7, 0.], [0., 1., 0.], [0., 0., 0.]], dtype=complex)
+    result = matrix_comparison(estimate, truth, [0, 1, 2])
+    assert result["strongest_input_agreements"] == 1
+    assert result["strongest_input_mismatches"] == []
+    assert result["ambiguous_rows"] == [0, 2]
+    assert result["strongest_inputs"][0]["estimated_inputs"] == [1, 2]
+    assert result["strongest_inputs"][2]["estimated_inputs"] == []
+    swapped = matrix_comparison(truth, estimate, [0, 1, 2])
+    assert swapped["ambiguous_rows"] == [0, 2]  # Ambiguity in the true matrix is also flagged.

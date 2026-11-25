@@ -9,6 +9,7 @@ import pytest
 
 from agents.runner import runner
 from fixtures.hardware import RecordingFakeBackend
+from hardware.bench_access import bench_access, request_shutdown
 from workflow.state import (AcquisitionAction, AcquisitionResult, Artifact, ExperimentProcedure,
                    HumanApproval, Setting, WorkflowState)
 from tools.hardware import (ActionReport, DisabledHardwareBackend,
@@ -128,6 +129,69 @@ def test_default_disabled_backend(hardware_setup):
     assert any("disabled" in issue.lower() for issue in result.technical_issues)
     with pytest.raises(RuntimeError, match="unavailable"):
         DisabledHardwareBackend().execute(None)
+
+
+def test_physical_runner_cannot_start_during_status_check(hardware_setup):
+    state, cfg, backend, procedure = hardware_setup
+    cfg.hardware_backend = "external"
+    backend.capabilities.data_origin = "physical"
+    review = preflight(procedure, cfg, backend)
+    assert review.status == "ready", review.issues
+    with bench_access():
+        result = runner(state, procedure.id, config=cfg, backend=backend, execute=True,
+                        reviewed=review, approval=approved(review))
+    assert result.status == "blocked" and "bench is in use" in result.explanation
+    assert not backend.execute_calls and not backend.cleanup_calls
+
+
+def test_stop_latch_cancels_physical_runner_and_invokes_owner_cleanup(hardware_setup):
+    state, cfg, backend, procedure = hardware_setup
+    cfg.hardware_backend = "external"
+    backend.capabilities.data_origin = "physical"
+    procedure.actions.append(procedure.actions[0].model_copy(deep=True))
+    calls = []
+
+    def acquire(action, *, cancel_event, **kwargs):
+        calls.append(action)
+        request_shutdown()
+        assert cancel_event.wait(0.1)
+        return ActionReport(aborted=True, errors=["cancelled by bench shutdown"])
+
+    backend.execute = acquire
+    review = preflight(procedure, cfg, backend)
+    assert review.status == "ready", review.issues
+    result = runner(state, procedure.id, config=cfg, backend=backend, execute=True,
+                    reviewed=review, approval=approved(review))
+    assert result.status == "aborted"
+    assert len(calls) == len(backend.cleanup_calls) == 1
+    assert result.acquisition.hardware.actions[1].status == "pending"
+    assert result.acquisition.hardware.cleanup_status == "completed"
+    again = runner(state, procedure.id, config=cfg, backend=backend, execute=True,
+                   reviewed=review, approval=approved(review))
+    assert again.status == "blocked" and len(calls) == 1
+
+
+def test_physical_runner_cleans_up_when_shutdown_arrives_after_final_action(hardware_setup, monkeypatch):
+    import tools.hardware as hardware_tools
+
+    state, cfg, backend, procedure = hardware_setup
+    cfg.hardware_backend = "external"
+    backend.capabilities.data_origin = "physical"
+    save = hardware_tools._save_record
+
+    def save_then_cancel(path, record):
+        save(path, record)
+        if record.status == "started" and record.hardware.actions[-1].status == "completed":
+            request_shutdown()
+
+    monkeypatch.setattr(hardware_tools, "_save_record", save_then_cancel)
+    review = preflight(procedure, cfg, backend)
+    result = runner(state, procedure.id, config=cfg, backend=backend, execute=True,
+                    reviewed=review, approval=approved(review))
+    assert result.status == "aborted"
+    assert result.acquisition.hardware.actions[-1].status == "completed"
+    assert result.acquisition.hardware.cleanup_status == "completed"
+    assert len(backend.cleanup_calls) == 1
 
 
 @pytest.mark.parametrize("problem", ["missing", "pending", "rejected", "revoked", "wrong_id",

@@ -15,6 +15,7 @@ from workflow.state import (AgentHandoff, AnalysisCode, Artifact, ConversationEn
                    LiteraturePassage, Text, WorkflowState)
 from tools.python_execution import ExecutionBackend, checked_inputs, execute_python, save_script
 from agents.common import HANDOFF_INSTRUCTIONS, handoff_context, save_handoff, validate_handoff
+from agents.common import planning_context, planning_state
 
 DEFAULT_SYSTEM_PROMPT = """You are the Experimentor for LC-SLM TM retrieval benchmarking.
 When llm_router_enabled is true, a separate routing LLM chooses the next permitted
@@ -60,11 +61,17 @@ from procedure_contract.supported_prerequisites. Put explanations in explanation
 not in that list. Only the backend supplies verification/evidence; describing a
 condition as satisfied never verifies it. Preserve genuine unknown requirements
 by requesting missing user inputs or scientific decisions, not inventing IDs.
+For bench.acquire, input_artifacts MUST be [] and calibration_artifacts MUST be {}.
+The simulator loads/verifies its private matrix from saved configuration and runs
+calibration itself. Its matrix JSON, hash, seed and setup context are not measurement
+or calibration inputs. Do not copy them into data/raw, widen input roots, ask the
+user to supply them, or list them as artifacts. Follow procedure_contract.artifacts.
 Runner preflight checks configuration, capabilities, limits and required IDs.
 bench.acquire performs calibration, which can fail and retain diagnostics; a
 successful calibration is not a planning prerequisite. Human approval is a later
-workflow gate and cannot be supplied in a procedure. bench.retrieve is a separate
-reviewed numerical operation offered after an eligible dataset exists. Its absence
+workflow gate and cannot be supplied in a procedure. bench.retrieve (GGS-only) and
+tm.compare_reference_free (matched GGS plus nonlinear intensity_ls) are separate
+reviewed numerical operations offered after an eligible dataset exists. Their absence
 from acquisition action IDs is expected. Consult numerical_capabilities separately.
 For procedure_validation feedback, repair the offending fields using the exact
 errors and allowed choices. Do not ask the user to certify workflow-owned checks.
@@ -152,6 +159,7 @@ class ProcedureValidationError(ValueError):
 
 def _procedure_contract(state):
     from tools.hardware import HardwareCapabilities
+    from bench.optical_bench import ACQUISITION_ARTIFACT_CONTRACT
     if state.control.hardware_context is None:
         raise ProcedureValidationError(["control.hardware_context: simulated capabilities were not supplied by the workflow"], state)
     caps = HardwareCapabilities.model_validate(state.control.hardware_context)
@@ -161,6 +169,7 @@ def _procedure_contract(state):
         "allowed_prerequisite_ids": sorted(caps.prerequisites),
         "required_prerequisite_ids": sorted({key for action in caps.actions.values() for key in action.required_prerequisites}),
         "explanation_field": "explanation",
+        "artifacts": ACQUISITION_ARTIFACT_CONTRACT,
         "stage_owners": {"preflight": "Validate backend configuration, capabilities, units, limits, budgets and prerequisite verification",
                          "acquisition": "Run calibration and record its success/failure before measurement capture",
                          "human": "Approve the exact reviewed procedure/fingerprint after preflight, before acquisition",
@@ -172,15 +181,24 @@ def _simulated_procedure_response(model, payload, snapshot, cfg, versions):
     """Repair malformed drafts locally; charge repairs to the existing revision budget."""
     from tools.hardware import prerequisite_id_errors
     from tools.tm_numerics import OPERATIONS
+    from analysis.tm_solvers import REFERENCE_FREE_METHODS
+    from bench.optical_bench import acquisition_artifact_errors
     caps, contract = _procedure_contract(snapshot)
     payload["procedure_contract"] = contract
     payload["numerical_capabilities"] = {"reviewed_numerics_enabled": cfg.reviewed_numerics_enabled,
+        "methods": REFERENCE_FREE_METHODS,
+        "bench_operations": {"bench.retrieve": ["ggs"], "tm.compare_reference_free": ["ggs", "intensity_ls"]},
+        "requirements": {"known_phase_only_patterns": True, "unclipped_fit_per_input_min": 8,
+                         "full_input_pattern_rank": True, "usable_holdout_per_detector_min": 8,
+                         "comparison": "One dataset, identical eligibility masks, shared seeded starts, training-only restart/iterate selection"},
         "operations": list(OPERATIONS) if cfg.reviewed_numerics_enabled else [],
         "availability": "Offered by routing only after eligible saved inputs exist; separate from acquisition capabilities"}
     payload["latest_preflight_errors"] = snapshot.acquisition_reviews[-1].issues if snapshot.acquisition_reviews else []
     reserve = int(snapshot.control.task == "technical_review" and any(v > 1 for v in versions.values()))
     repairs = max(0, cfg.max_procedure_revisions - snapshot.control.procedure_revisions - reserve)
     calls, messages = 0, []
+    artifact_repair = any("procedure.input_artifacts" in issue or "procedure.calibration_artifacts" in issue
+                          for issue in payload["latest_preflight_errors"])
     for revision in range(min(1 + repairs, cfg.max_workflow_iterations)):
         payload["remaining_procedure_repairs"] = max(0, repairs - revision)
         previous = None
@@ -191,6 +209,9 @@ def _simulated_procedure_response(model, payload, snapshot, cfg, versions):
             errors = prerequisite_id_errors(outcome.procedure, caps) if outcome.kind == "procedure" else []
             if outcome.kind == "procedure":
                 proc = outcome.procedure
+                artifact_errors = acquisition_artifact_errors(proc)
+                artifact_repair = artifact_repair or bool(artifact_errors)
+                errors.extend(artifact_errors)
                 expected = versions.get(str(proc.proposal_id))
                 if expected is None:
                     errors.append("procedure.proposal_id: select an existing Scientist proposal")
@@ -206,6 +227,8 @@ def _simulated_procedure_response(model, payload, snapshot, cfg, versions):
                 errors.append(f"cited_source_ids: choose only supplied source IDs {sorted(allowed_citations)}")
             if revision and outcome.kind == "analysis":
                 errors = ["kind: procedure repair must return a repaired procedure or an explicit missing-input request, not switch to analysis"]
+            if artifact_repair and outcome.kind == "request_information":
+                errors.append("procedure.input_artifacts/calibration_artifacts: simulator inputs are backend-owned, not missing user inputs; return a repaired procedure instead of asking the user to supply or relocate private configuration")
         except ValueError as exc:
             errors = [f"procedure/model_response: {exc}"]
         except Exception as exc:
@@ -220,12 +243,13 @@ def _simulated_procedure_response(model, payload, snapshot, cfg, versions):
         if previous:
             messages.append("Rejected draft (not an accepted procedure): " + json.dumps(previous, ensure_ascii=False))
         payload["procedure_validation"] = {"errors": errors, "allowed_prerequisite_ids": contract["allowed_prerequisite_ids"],
+            "artifact_contract": contract["artifacts"],
             "previous_response": previous, "instruction": "Repair the invalid fields; keep genuine missing inputs explicit in request_information"}
         if revision >= repairs or calls >= cfg.max_workflow_iterations:
             snapshot.conversation.append(ConversationEntry(role="experimentor", message="\n\n".join(messages)))
             raise ProcedureValidationError([*errors, "procedure repair budget exhausted; no acquisition procedure accepted"], snapshot)
         snapshot.control.procedure_revisions += 1
-        payload["workflow_state"] = snapshot.model_dump(mode="json")
+        payload["workflow_state"] = planning_state(snapshot)
 
 
 def _ask(model: ChatModel, schema: type[BaseModel], payload: dict) -> BaseModel:
@@ -260,12 +284,12 @@ def experimentor(
     a separate record. No history is replayed into state or approved hardware touched.
     """
     cfg = AppConfig.model_validate((config or AppConfig()).model_dump())
-    context = read_context(architecture_path, literature_context)
+    context = planning_context(read_context(architecture_path, literature_context), state)
     snapshot = WorkflowState.model_validate(state.model_dump())
     versions = {str(p.id): 1 + max((proc.version for proc in snapshot.procedures
                                    if proc.proposal_id == p.id), default=0)
                 for p in snapshot.proposals}
-    payload = {"workflow_state": snapshot.model_dump(mode="json"),
+    payload = {"workflow_state": planning_state(snapshot),
                "handoffs": handoff_context(snapshot, "experimentor"),
                "handoff_required": bool(snapshot.control.configuration),
                **context.model_dump(mode="json"), "next_procedure_versions": versions,
@@ -365,7 +389,7 @@ def experimentor(
                         f"{result.execution.reason or ''} Metrics: {json.dumps(result.metrics)}")
         if result.execution.status == "unavailable":
             break
-        payload["workflow_state"] = snapshot.model_dump(mode="json")
+        payload["workflow_state"] = planning_state(snapshot)
         payload["latest_execution"] = result.model_dump(mode="json")
         if total_calls >= cfg.max_workflow_iterations:
             messages.append("Workflow model-call limit reached; execution recorded without model review.")

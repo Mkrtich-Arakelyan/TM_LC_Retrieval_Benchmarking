@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_serializer, model_validator
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Status = Literal["pending", "completed", "failed"]
@@ -45,6 +45,14 @@ class ExperimentProposal(Record):
     evaluation_criteria: list[Text] = Field(min_length=1)
     assumptions: list[Text] = Field(default_factory=list)
     literature_references: list[Text] = Field(default_factory=list)
+    retrieval_methods: list[Literal["ggs", "intensity_ls"]] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def recorded_methods(self, handler):
+        data = handler(self)
+        if not self.retrieval_methods:
+            data.pop("retrieval_methods", None)  # Preserve legacy proposal/review material.
+        return data
 
 
 class AcquisitionAction(BaseModel):

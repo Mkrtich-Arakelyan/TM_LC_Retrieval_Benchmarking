@@ -9,6 +9,11 @@ import numpy as np
 
 from workflow.state import TMFitSettings
 
+REFERENCE_FREE_METHODS = {
+    "ggs": "Generalized Gerchberg-Saxton: replace predicted field amplitudes with sqrt(measured intensity), then refit the complex coefficients by least squares.",
+    "intensity_ls": "Nonlinear intensity least squares: minimize mean((abs(X @ T.T)**2 - I)**2) over complex coefficients using the real-coordinate complex gradient and backtracking descent.",
+}
+
 
 def _archive(path: str, keys: set[str]) -> dict[str, np.ndarray]:
     # Bound uncompressed input before allocating arrays; never unpickle datasets.

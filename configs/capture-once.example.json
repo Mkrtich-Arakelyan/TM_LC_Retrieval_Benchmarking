@@ -1,0 +1,52 @@
+{
+  "camera_trigger_confirmed": false,
+  "gray_level": 0,
+  "laser_settle_seconds": 0,
+  "slm": {
+    "dll_path": "C:/REPLACE-WITH-VERIFIED-SDK/Blink_C_wrapper.dll",
+    "lut_path": "C:/REPLACE-WITH-VERIFIED-LUT/device.LUT",
+    "board_number": 1,
+    "bit_depth": 12,
+    "is_nematic": true,
+    "ram_write_enabled": true,
+    "use_gpu": false,
+    "max_transient_frames": 20,
+    "wait_for_trigger": false,
+    "pulse_on_image_flip": true,
+    "pulse_on_refresh": false,
+    "timeout_ms": 5000,
+    "image_size_convention": "pixel_count",
+    "return_codes": {"load_lut": null, "write_image": null, "image_complete": null}
+  },
+  "camera": {
+    "camera_index": 0,
+    "roi_width": 1664,
+    "roi_height": 760,
+    "roi_x": 832,
+    "roi_y": 792,
+    "horizontal_binning": 1,
+    "vertical_binning": 1,
+    "video_mode": 0,
+    "pixel_format": "mono8",
+    "shutter": 6000,
+    "frame_rate": 60,
+    "trigger": {"enabled": true, "external_input": 1, "detect_external_input_edge": true, "delay": 3000, "debounce_time": 0}
+  },
+  "generator": {
+    "enabled": false,
+    "visa_resource": "USB0::0x1AB1::0x0643::DG8A261900744::INSTR"
+  },
+  "lcc": null,
+  "laser": {
+    "port": "COM1",
+    "operating_power": 1.0,
+    "startup_order": ["enable", "open_shutter", "set_power"],
+    "startup_confirmed": false,
+    "command_terminator": "\r\n",
+    "response_terminator": "\r\n",
+    "echo_commands": null,
+    "timeout_seconds": 2.0,
+    "shutdown_replies": null,
+    "command_ack": null
+  }
+}
