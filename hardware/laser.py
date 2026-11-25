@@ -16,6 +16,9 @@ from hardware.bench_access import device_access, require_acquisition_allowed
 
 
 SHUTDOWN_EXPECTED = {"?S": 0, "?L": 0, "?SP": 0.01}
+# The second spelling was observed in the lab's read-only status output.
+# Recognizing framing does not establish controller identity or new commands.
+REPLY_PROMPTS = ("Verdi>", "Viper V-5>")
 
 
 class LaserError(RuntimeError):
@@ -34,14 +37,21 @@ def _reply_payload(instruction: str, raw: bytes) -> str:
     if "error" in text.lower():
         raise LaserError(f"Unconfirmed Verdi error reply: {text!r}")
     text = text.strip(" \t\r\n")
-    if text.startswith("Verdi>"):
-        text = text[len("Verdi>"):].lstrip(" \t\r\n")
+    def strip_leading_prompts(value):
+        while value.startswith(REPLY_PROMPTS):
+            prompt = next(p for p in REPLY_PROMPTS if value.startswith(p))
+            value = value[len(prompt):].lstrip(" \t\r\n")
+        return value
+
+    # A previous reply can leave a prompt-only line ahead of this query's
+    # prompt/echo. Strip only recognized prompts, never unknown text or values.
+    text = strip_leading_prompts(text)
     if text.startswith(instruction):
         text = text[len(instruction):].lstrip(" \t\r\n")
-        if text.startswith("Verdi>"):
-            text = text[len("Verdi>"):].lstrip(" \t\r\n")
-    if text.endswith("Verdi>"):
-        text = text[:-len("Verdi>")].rstrip(" \t\r\n")
+        text = strip_leading_prompts(text)
+    while text.endswith(REPLY_PROMPTS):
+        prompt = next(p for p in REPLY_PROMPTS if text.endswith(p))
+        text = text[:-len(prompt)].rstrip(" \t\r\n")
     return text
 
 

@@ -64,7 +64,7 @@ The parser uses these meanings:
 | `?P` | Calibrated measured output power in W; diagnostic, not setpoint |
 | `?SP` | Configured light-regulation setpoint in W; must equal 0.01 for shutdown |
 
-CRLF replies may include an optional `Verdi>` prompt and the exact query echo,
+CRLF replies may include an optional `Verdi>` or observed `Viper V-5>` prompt and the exact query echo,
 inline or on separate lines. The parser rejects other text, multiple values,
 non-finite/negative power and error messages rather than searching for a number.
 Normal commands return blank framing and/or prompt/echo; error responses fail.
@@ -190,6 +190,24 @@ capture results linked by the physical Runner record. An aggregate Runner cleanu
 status gives no per-device confirmation. The shared bench lock covers captures,
 physical Runner acquisitions, and checks launched from this checkout. Wait for
 any experiment launched outside those entry points to finish before checking.
+
+## Query-only laser status before a capture
+
+From Anaconda Prompt at the repository root:
+
+```bat
+conda activate myenv
+python check_laser_status.py --config config.local.json
+```
+
+No run directory is required, and `laser.startup_confirmed` may remain false.
+Only the laser section is loaded. Under the shared bench lock, the checker uses
+`LabLaser.read_status_once()` to open serial, send `?S`, `?L`, `?P`, `?SP`, and
+close serial directly. It sends no startup or shutdown commands. It reports the
+actual shutter/laser state, measured power and setpoint; invalid replies are
+`UNVERIFIED`. Exit zero means all four queries and serial close succeeded, even
+if the laser reports on or fault. Busy ownership, query or close failures return
+nonzero. This is a controller status check, not shutdown confirmation.
 
 ## Active shutdown
 

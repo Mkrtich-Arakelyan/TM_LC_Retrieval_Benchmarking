@@ -431,3 +431,47 @@ def test_command_errors_with_numeric_operands_are_not_successful_off_actions(set
     result = laser.disconnect()
     assert not result["confirmed"]
     assert result["actions"][0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("query,raw,expected", [
+    ("?P", b"Viper V-5>0.005\r\n", 0.005),
+    ("?SP", b"Viper V-5>0.0100\r\n", 0.01),
+    ("?S", b"Viper V-5>0\r\n", 0),
+    ("?L", b"Viper V-5>?L\r\n1\r\n", 1),
+    ("?P", b"?P\r\nViper V-5>0.005\r\n", 0.005),
+    ("?SP", b"0.0100\r\nViper V-5>\r\n", 0.01),
+])
+def test_observed_viper_prompt_is_known_framing(query, raw, expected):
+    assert parse_verdi_reply(query, raw) == expected
+
+
+@pytest.mark.parametrize("query,raw", [
+    ("?L", b"Viper V-5> Command Error:L\r\n"),
+    ("?P", b"Viper V-5>0.005"),  # A literal missing CRLF is still invalid.
+    ("?SP", b"Viper V-5>0.0100"),
+    ("?SP", b"Viper V-5>?P0.005\r\n"),  # Wrong echoed query.
+    ("?P", b"Other controller>0.005\r\n"),
+    ("?P", b"Viper V-5>0.005\r\n0.0100\r\n"),
+])
+def test_viper_prompt_does_not_relax_errors_framing_or_query_matching(query, raw):
+    with pytest.raises(LaserError):
+        parse_verdi_reply(query, raw)
+
+
+def test_viper_pending_prompt_and_error_do_not_shift_next_query(settings):
+    events = []
+    laser, port = laser_for(settings, events)
+    port.responses.update({"?S": b"0\r\nViper V-5>\r\n",
+        "?L": b"Viper V-5> Command Error:L\r\n",
+        "?P": b"Viper V-5>?P\r\n0.005\r\nViper V-5>\r\n",
+        "?SP": b"Viper V-5>?SP\r\n0.0100\r\n"})
+    states = laser.read_status_once()
+    assert states["?S"]["value"] == 0
+    assert not states["?L"]["valid"]
+    assert "Command Error:L" in states["?L"]["error"]
+    assert states["?P"]["value"] == 0.005
+    assert states["?SP"]["value"] == 0.01
+    assert events == ["serial.open", "?S", "?L", "?P", "?SP", "serial.close"]
+    assert laser.transcript[1]["raw_replies_hex"] == [
+        b"Viper V-5>\r\n".hex(), b"Viper V-5> Command Error:L\r\n".hex()]
+    assert not port.is_open
